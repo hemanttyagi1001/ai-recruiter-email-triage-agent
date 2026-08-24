@@ -1,0 +1,33 @@
+# WHY this file matters more than usual here: everything in the build context
+# is readable by the build, and anything COPY'd lands in a layer that survives
+# `docker rm`. token.json is a live OAuth refresh token and candidate.toml has
+# salary data — neither should ever be in an image. They are mounted at
+# runtime by docker-compose.yml instead.
+.env
+.env.example
+credentials.json
+token.json
+candidate.toml
+*.pdf
+
+.git
+.gitignore
+logs/
+tests/
+alembic/
+docs/
+scripts/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.idea/
+.vscode/
+.foundry/
+Dockerfile
+docker-compose.yml

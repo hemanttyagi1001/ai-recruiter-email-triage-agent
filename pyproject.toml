@@ -1,0 +1,44 @@
+[project]
+name = "recruiter-triage"
+version = "0.0.1"
+description = "Recruiter email triage agent — Phase 0 (read-only ingestion)"
+requires-python = ">=3.11"
+dependencies = [
+    "sqlalchemy>=2.0",
+    "psycopg[binary,pool]>=3.2",
+    "alembic>=1.13",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "python-dotenv>=1.0",
+    "openai>=1.50",
+    "google-api-python-client>=2.140",
+    "google-auth-oauthlib>=1.2",
+    "google-auth-httplib2>=0.2",
+    "beautifulsoup4>=4.12",
+    "langgraph>=0.2",
+    # Phase 2 additions
+    "langgraph-checkpoint-postgres>=2.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    # Phase 4 additions — pgvector SQLAlchemy type + operator support
+    "pgvector>=0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-mock>=3.14",
+    "httpx>=0.27",  # FastAPI TestClient
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"

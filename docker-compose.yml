@@ -1,0 +1,112 @@
+# Local stack for the recruiter triage agent.
+#
+# `docker compose up -d` starts the AGENT ONLY. The bundled `db` service below
+# is behind a profile and stays stopped unless you ask for it — see the note on
+# that service for why.
+
+services:
+  # ---------------------------------------------------------------------------
+  # The agent: a poll loop, not a server. No ports, no healthcheck endpoint.
+  # ---------------------------------------------------------------------------
+  agent:
+    build: .
+    container_name: ai-recruiter-email-triage-agent
+    restart: unless-stopped
+
+    # CONCEPT: reaching a database that is NOT part of this compose project.
+    #   Inside a container, `localhost` is the container itself, so the
+    #   DATABASE_URL in .env (which points at localhost:5432 for host-side CLI
+    #   use) cannot work here. `host.docker.internal` resolves to the Docker
+    #   host, which is where the standalone `pgvector` container publishes
+    #   5432. The agent therefore talks to the same database the host CLI does.
+    # WHY a separate env var instead of editing DATABASE_URL: the CLI, pytest
+    # and alembic all still run on the host and need the localhost form. One
+    # variable per audience beats one variable that is wrong for someone.
+    # GOTCHA: DOCKER_DATABASE_URL lives in .env (gitignored) because it carries
+    # the DB password. It is deliberately not written into this tracked file.
+    environment:
+      DATABASE_URL: ${DOCKER_DATABASE_URL:?set DOCKER_DATABASE_URL in .env — see .env.example}
+      # The host path in .env is relative to the repo; inside the container the
+      # file lives under /app. Overriding here keeps .env correct for host-side
+      # CLI use and correct for the container at the same time.
+      # GOTCHA: the basename MUST be preserved. _pdf_part names the attachment
+      # from the path, so mounting at a generic /app/resume.pdf makes every
+      # recruiter receive "resume.pdf" — anonymous, and easy to lose in a
+      # folder of identical filenames. Keeping the real filename is the whole
+      # reason this interpolates RESUME_PATH instead of hardcoding a path.
+      RESUME_PATH: /app/${RESUME_PATH:-hemant_tyagi_aiml_engineer.pdf}
+    env_file:
+      - .env
+
+    # WHY host-gateway: Docker Desktop provides host.docker.internal
+    # automatically, but plain Docker Engine on Linux does not. Declaring it
+    # explicitly makes the same compose file work in both places.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      # GOTCHA: token.json is mounted READ-WRITE on purpose. Access tokens
+      # expire hourly and load_credentials() rewrites this file on every
+      # refresh — mount it :ro and the agent authenticates fine for an hour,
+      # then fails with a permission error that looks nothing like its cause.
+      - ./token.json:/app/token.json
+      # credentials.json is the OAuth client identity. Never rewritten, so it
+      # stays read-only.
+      - ./credentials.json:/app/credentials.json:ro
+      # Your profile. Read-only; reloaded every cycle, so no restart needed.
+      - ./candidate.toml:/app/candidate.toml:ro
+      # The CV. Read-only, and read at send time rather than cached — replace
+      # the file on the host and the next reply carries the new version.
+      # GOTCHA: the "./" prefix is required. RESUME_PATH in .env is a bare
+      # relative path (correct for host-side CLI use), and Compose reads a
+      # source without a leading ./ or / as a NAMED VOLUME rather than a bind
+      # mount — so the container would silently get an empty directory at
+      # /app/resume.pdf instead of the CV, and every attachment would fail.
+      - ./${RESUME_PATH:-hemant_tyagi_aiml_engineer.pdf}:/app/${RESUME_PATH:-hemant_tyagi_aiml_engineer.pdf}:ro
+      # Logs land on the host so they outlive `docker rm`.
+      - ./logs:/app/logs
+
+    # WHY SIGTERM with a generous grace period: app/cli/watch.py catches
+    # SIGTERM and finishes the message in flight rather than dying mid-graph.
+    # Docker's default 10s would often escalate to SIGKILL during an LLM call.
+    # Interruption is survivable — checkpointing sees to that — but a clean
+    # stop leaves no partial run row to explain later.
+    stop_signal: SIGTERM
+    stop_grace_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Optional bundled Postgres. NOT started by default.
+  # ---------------------------------------------------------------------------
+  # WHY behind a profile: this project's operator already runs a standalone
+  # `pgvector` container publishing 5432 for several projects. Starting this
+  # service too would collide on that port, and the agent would then be pointed
+  # at whichever container won the race — with a different database inside it.
+  # A profile means `docker compose up` cannot start it by accident.
+  #
+  # To use this one INSTEAD of the standalone container:
+  #   docker compose --profile bundled-db up -d
+  # and point DOCKER_DATABASE_URL at `db:5432` rather than
+  # host.docker.internal (compose puts both services on one network, so the
+  # service name resolves).
+  db:
+    profiles: ["bundled-db"]
+    image: pgvector/pgvector:pg16
+    container_name: triage_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: triage
+      POSTGRES_PASSWORD: triage_local
+      POSTGRES_DB: triage
+    ports:
+      - "5432:5432"
+    volumes:
+      - triage_pg:/var/lib/postgresql/data
+      - ./scripts/init_test_db.sql:/docker-entrypoint-initdb.d/init_test_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U triage -d triage"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  triage_pg:

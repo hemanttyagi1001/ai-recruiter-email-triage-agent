@@ -1,0 +1,108 @@
+# Copy to candidate.toml and fill with your real profile.
+# candidate.toml is gitignored — it contains your personal salary,
+# location, and status information. THIS file is tracked by git, so never
+# put real figures here.
+#
+# ---------------------------------------------------------------------------
+# PLACEHOLDERS
+# ---------------------------------------------------------------------------
+# Every field under [candidate] except `name` is optional. Leave one out (or
+# commented) and it renders as the literal "NA" wherever it would have
+# appeared — in the reply sent to the recruiter, and in the prompt the fit
+# scorer reads. Startup logs a warning listing whatever is still unfilled, so
+# you can see at a glance what remains.
+#
+# Values below marked FILL-ME are placeholders. Replace them and the agent
+# picks up the real value on its next run — no code change, no rebuild.
+#
+# GOTCHA: "NA" is not harmless when autonomous sending is on. An "interested"
+# reply built from an unfilled profile really does go out reading "I have NA
+# years total, NA LPA current". Fill these before enabling AUTO_SEND_MODE=on.
+# ---------------------------------------------------------------------------
+
+[candidate]
+# Required — the only field with no NA fallback. Not used in any outbound
+# text; it identifies whose profile this file is.
+name = "FILL-ME: Your Full Name"
+
+# Optional from here down. Each is COMMENTED OUT, which is what makes it
+# render as NA. Uncomment a line and put your real value in to activate it.
+#
+# WHY commented rather than set to a placeholder value: a placeholder still
+# has to BE something. `total_years = 0` is not "unfilled", it is a claim of
+# zero years' experience — and it would go out in a reply as "0 years total".
+# An absent line is the only unambiguous way to say "I have not answered this
+# yet". Strings are additionally guarded: any value left as FILL-ME is
+# treated as unfilled too, so a half-edited copy still degrades to NA rather
+# than emailing the word FILL-ME to a recruiter.
+
+# total_years = 14                      # total years of experience
+# relevant_years = 12                   # years in your primary stack
+# stack = ".NET / Python"               # primary tech stack
+# current_ctc_lpa = 42.0                # current CTC, in LPA
+# expected_ctc_lpa = 55.0               # expected CTC, in LPA
+# notice_period = "60 days"             # e.g. "60 days", "immediate"
+# current_location = "Delhi NCR"        # where you are now
+# preferred_location = "Delhi NCR or remote"
+# employment_status = "Currently employed"
+
+[rules]
+# ctc_max below this floor → deterministic decline (D-decliner in engine).
+# Independent of expected_ctc so you can quietly entertain lower offers if
+# you want, without triggering the auto-decline.
+ctc_floor_lpa = 38.0
+
+[scoring]
+# Fit score >= threshold → interested draft.
+# Below threshold (but not uncertain) → soft-decline draft.
+fit_threshold = 65
+
+[drafts]
+# Outbound validator rejects any draft body longer than this.
+# NOTE: the signature below counts toward this limit.
+max_length_chars = 3000
+
+# Appended to every outbound reply — declines and interested alike.
+#
+# WHY the agent emits this rather than relying on your Gmail signature:
+# Gmail only appends your configured signature to mail you compose in its web
+# UI. A draft created through the API carries exactly the body we build, and
+# an auto-sent reply never touches the UI at all — so without this, autonomous
+# replies go out unsigned.
+#
+# GOTCHA: this text passes through the outbound validator with the rest of the
+# body. A PAN-shaped (ABCDE1234F) or Aadhaar-shaped (12 digits) token here
+# would quarantine EVERY draft, not just one. A 10-digit Indian mobile is fine;
+# writing it as 12 digits with the country code and no "+" would not be.
+#
+# Leave commented out for no signature.
+# signature = """
+# Looking forward to your response.
+#
+# Warm Regards
+# Your Name
+# Your Title
+# +91 00000 00000
+# you@example.com
+# https://www.linkedin.com/in/you
+# """
+
+[dedup]
+# Phase 4 — near-duplicate detection over jd_text embeddings.
+#
+# lookback_days: only flag against opportunities received within this window.
+#   60 covers most vendor re-pitches without merging genuinely new listings
+#   of an old role. See D27.
+#
+# similarity_threshold: cosine >= this fires a flag. Placeholder until
+#   bench/dedup/calibrate.py runs against a hand-labelled pair set. See D29.
+#
+# min_jd_chars: don't embed JDs shorter than this — too little signal for
+#   the embedding to be meaningful, and would produce noisy near-matches
+#   against unrelated short texts.
+#
+# max_candidates_returned: top-K neighbours to persist per new opportunity.
+lookback_days = 60
+similarity_threshold = 0.85
+min_jd_chars = 100
+max_candidates_returned = 5

@@ -1,0 +1,19 @@
+.env
+credentials.json
+token.json
+candidate.toml
+# Resume PDF — personal document, attached to outbound mail at runtime.
+# Mounted into the container by docker-compose, never baked into the image.
+*.pdf
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.idea/
+.vscode/

@@ -1,0 +1,5 @@
+Hi {salutation},
+
+Thanks for reaching out{about_role}. This one isn't a fit for me right now — {reason}.
+
+Please feel free to keep me in mind for future roles that match.
