@@ -1053,3 +1053,60 @@ it.
 **Revisit if:** replies start reading as passive and conversations stall on
 missing details, which would argue for one question again — or for surfacing
 the missing fields in the digest instead of in the reply.
+
+## D62 — The test harness may never resolve to the production database (2026-08-25)
+**Decision:** `tests/conftest.py` reads TEST_DATABASE_URL from the process
+environment *or* `.env`, binds `_engine` to that URL explicitly, and routes
+every URL through `_assert_not_production()`, which raises if the resolved
+database name equals the one `DATABASE_URL` names.
+**Alternatives:** document the "export it first" requirement more loudly
+(status quo — it was already documented and still failed); drop the
+`drop_all` and rely on TRUNCATE (loses schema-drift detection between runs).
+**Reason:** the skip guard read `settings.test_database_url`, which
+pydantic-settings fills from `.env`, while the engine connected to
+`settings.database_url` — production. Only a shell-exported TEST_DATABASE_URL
+reconciled them. On 2026-08-24 ~13:33 UTC a plain `pytest` therefore passed
+the guard, connected to `triage`, and dropped every application table. The
+watcher then failed 73 consecutive cycles on `relation "runs" does not exist`,
+unnoticed for ~44 hours, and all message/draft history was lost.
+**Quick fix vs systemic fix:** the quick fix is `alembic stamp base && alembic
+upgrade head` to rebuild the schema. The systemic fix is this entry — one
+source of truth for the test URL, plus a refusal that does not depend on
+anyone remembering to export anything.
+**GOTCHA it leaves behind:** a poll loop that dies on its FIRST DB write is
+silent, not loud. Nothing alerted; the failure was visible only in a log
+nobody was reading. Detection is still unsolved — see revisit.
+**Revisit if:** we add liveness alerting (a run row older than N cycles, or a
+dead-letter on repeated cycle failure), which would have caught this in
+minutes rather than days.
+
+## D63 — LangSmith tracing, with redaction in code and free text dropped (2026-08-26)
+**Decision:** Tracing is opt-in via `LANGSMITH_TRACING` and off by default.
+When on, both trace sources — the LangGraph node tracer and the `wrap_openai`
+wrapper around the Azure SDK — are handed the SAME `Client`, whose anonymizer
+is built in `app/observability/redaction.py`. Free-text fields (`body_text`,
+`jd_text`, `draft_body`, `subject`, `recruiter_name`, `company`, `raw_headers`,
+and LLM `content`) are replaced wholesale; emails, phones, PAN and URLs are
+masked everywhere else. The redactor fails CLOSED.
+**Alternatives:** (a) graph-only tracing with no LLM wrapper — cheaper, but
+prompts are the email body and would be the one thing left untraced;
+(b) keep body text and regex-mask identifiers inside it — far better for
+debugging extraction, rejected because recruiter names, employer names and CTC
+survive a regex and those are exactly what the public-repo anonymisation was
+about.
+**Reason:** a trace is a copy of other people's mail on a vendor's servers.
+Redaction therefore lives in code with tests, not in a setting — same argument
+as D11 (rules) and D14 (outbound validator): a constraint that must not be
+violated is not a config value.
+**Fail CLOSED, against the house style:** every other guard here fails open —
+`already_replied` returns False on a DB error so a real recruiter is never
+silently dropped (D60). That inverts here. Failing open means an unredacted
+email body on a third party's disk, which noticing later does not undo.
+**GOTCHA:** `wrap_openai` builds its own client from the ambient environment
+unless passed `tracing_extra={"client": ...}`. Miss that and node state is
+redacted while the raw prompt uploads verbatim in the child run — and the UI
+looks correct at a glance. `app/observability/tracing.py` is the only place a
+client is constructed, specifically so this cannot drift.
+**Revisit if:** debugging extraction proves impossible without the JD text, in
+which case (b) belongs here as a SECOND replacer chosen by an explicit
+setting, never as a loosening of this one.

@@ -22,6 +22,12 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     # Phase 4 additions — pgvector SQLAlchemy type + operator support
     "pgvector>=0.3",
+    # Phase 7 — LangSmith tracing. Already arrives transitively via
+    # langchain-core (a langgraph dependency), but app/observability imports it
+    # directly, and a package you import is a package you declare: otherwise a
+    # future langgraph release that drops the transitive edge breaks us at
+    # runtime rather than at install time.
+    "langsmith>=0.9",
 ]
 
 [project.optional-dependencies]

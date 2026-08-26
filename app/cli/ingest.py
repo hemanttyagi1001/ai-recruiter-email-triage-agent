@@ -31,6 +31,7 @@ from app.db.models import Message, MessageStatus, Run, RunStatus
 from app.gmail.client import GmailClient
 from app.gmail.parser import parse_message
 from app.llm.client import LLMClient
+from app.observability.tracing import trace_callbacks
 from app.pipeline.checkpointer import open_checkpointer
 from app.pipeline.graph import build_graph
 from app.retry import PermanentExternalError
@@ -181,7 +182,14 @@ def _process_one(gmail_id, gmail, graph, run_id, counters) -> None:
     # LangGraph's way of scoping a call to a thread. Every subsequent
     # invoke against the same thread_id (from ANY process) will resume
     # from the last checkpoint for this Message-ID.
-    config = {"configurable": {"thread_id": parsed.message_id}}
+    # TRACE: `callbacks` is empty unless LANGSMITH_TRACING is on. When it is,
+    # this one tracer produces a run tree per message — a parent run for the
+    # graph and a child per node — with every string passed through the
+    # redactor in app/observability/redaction.py before upload.
+    config = {
+        "configurable": {"thread_id": parsed.message_id},
+        "callbacks": trace_callbacks(),
+    }
     final_state = graph.invoke({"parsed": parsed, "run_id": run_id}, config=config)
 
     _tally_usage(counters, final_state)

@@ -1,7 +1,7 @@
 """
 Test harness.
 
-Two things are load-bearing about this file:
+Three things are load-bearing about this file:
 
 1. The DATABASE_URL override happens BEFORE `app.config` is imported. Since
    `settings` is instantiated at import time, we must swap the env var
@@ -11,15 +11,107 @@ Two things are load-bearing about this file:
 2. The DB fixture wraps each test in a transaction and rolls back at the
    end. That's how we get test isolation without dropping/creating tables
    per-test — the schema stays put, but each test's writes vanish.
+
+3. Every path to a database URL in this file is checked against the
+   PRODUCTION url before anything connects. See the incident note below —
+   this file holds the only `drop_all` in the repo, and it once ran against
+   the wrong database.
+
+GOTCHA (2026-08-24, D62): the guard and the connection used to read
+  different values. The skip guard consulted `settings.test_database_url`,
+  which pydantic-settings populates from `.env`; the engine then connected to
+  `settings.database_url`, which `.env` populates with PRODUCTION. The
+  override above was the only thing that reconciled them, and it fired solely
+  when TEST_DATABASE_URL was exported into the SHELL — `.env` alone did not
+  satisfy it. So `pytest` in a clean shell passed the guard, connected to the
+  production database, and dropped every application table. 73 watch cycles
+  then failed on `relation "runs" does not exist` before anyone noticed,
+  because a poll loop that dies on its first DB write is silent, not loud.
+  The repair is structural, not a warning in a docstring: `.env` now satisfies
+  the override too, and `_assert_not_production` gates every connection.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _from_dotenv(key: str) -> str | None:
+    """Read one key out of `.env` without importing app.config.
+
+    WHY not just use pydantic-settings, which already parses this file: the
+    entire purpose of the block below is to rewrite DATABASE_URL *before*
+    app.config is imported. Importing app.config to discover what to rewrite
+    would instantiate `settings` against the un-rewritten value, which is the
+    ordering we are trying to preserve. Twenty lines of parser is the price of
+    not having a bootstrap cycle here.
+    """
+    env_path = _REPO_ROOT / ".env"
+    if not env_path.is_file():
+        return None
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        if name.strip() == key:
+            return value.strip().strip('"').strip("'")
+    return None
+
+
+def _db_name(url: str) -> str:
+    """The database name from a SQLAlchemy URL, ignoring any `?...` suffix.
+
+    WHY compare on the database name rather than the whole URL string: the
+    same database is reachable as `localhost:5432/triage` from the host and
+    `host.docker.internal:5432/triage` from a container (see
+    docker-compose.yml). Comparing full URLs would call those two different
+    databases and wave the destructive path straight through.
+    """
+    return url.rsplit("/", 1)[-1].split("?", 1)[0]
+
 
 # --- Env override: MUST happen before any `from app...` import ---
-_TEST_DB_URL = os.environ.get("TEST_DATABASE_URL")
+# WHY `.env` is consulted as a fallback for BOTH values: the old version read
+# TEST_DATABASE_URL from the process environment only, while the skip guard
+# read it via settings (i.e. from `.env`). One source disagreeing with the
+# other is exactly what pointed drop_all at production.
+_PROD_DB_URL = os.environ.get("DATABASE_URL") or _from_dotenv("DATABASE_URL")
+_TEST_DB_URL = os.environ.get("TEST_DATABASE_URL") or _from_dotenv("TEST_DATABASE_URL")
+
+
+def _assert_not_production(url: str, what: str) -> None:
+    """Refuse to hand out a URL that names the production database.
+
+    TRACE: called twice — once at import time on the override below, once in
+    the `_engine` fixture immediately before create_engine. The second call is
+    not redundant: it re-checks the value that SQLAlchemy will actually
+    receive, after settings has resolved it, so a future edit that changes
+    where the engine gets its URL still cannot slip past.
+
+    WHY RuntimeError and not pytest.skip: a misconfigured test database is a
+    broken environment, and skipping would hide it behind a green run. This
+    aborts collection with the reason on screen.
+    """
+    if _PROD_DB_URL and _db_name(url) == _db_name(_PROD_DB_URL):
+        raise RuntimeError(
+            f"REFUSING TO RUN: {what} resolves to database "
+            f"{_db_name(url)!r}, which is the same database DATABASE_URL "
+            f"names. This fixture calls Base.metadata.drop_all(). Point "
+            f"TEST_DATABASE_URL at a scratch database (e.g. triage_test) "
+            f"before running pytest."
+        )
+
+
 if _TEST_DB_URL:
+    _assert_not_production(_TEST_DB_URL, "TEST_DATABASE_URL")
+    # WHY the override still exists: application code under test calls
+    # `session_scope()`, which reads settings.database_url. Without this the
+    # code being tested would write to production even though the fixture's
+    # own engine points elsewhere.
     os.environ["DATABASE_URL"] = _TEST_DB_URL
 
 # Provide harmless defaults for tests that never actually call Azure. Real
@@ -67,12 +159,23 @@ from app.llm.client import Usage  # noqa: E402
 
 @pytest.fixture(scope="session")
 def _engine():
-    if not settings.test_database_url:
+    # GOTCHA: the guard reads the module-level `_TEST_DB_URL`, NOT
+    # `settings.test_database_url`. They look interchangeable and are not —
+    # settings resolves through `.env` on its own, so a guard written against
+    # it can pass while the override at the top of this file never fired. That
+    # divergence is what dropped the production schema on 2026-08-24.
+    if not _TEST_DB_URL:
         pytest.skip(
             "TEST_DATABASE_URL not configured; skipping DB tests. "
             "Point it at a scratch Postgres to enable."
         )
-    engine = create_engine(settings.database_url, future=True)
+    # Connect to the TEST url explicitly rather than to settings.database_url.
+    # The override above should have made them identical; asserting that here
+    # rather than trusting it means a broken override fails loudly instead of
+    # quietly aiming drop_all somewhere else.
+    _assert_not_production(_TEST_DB_URL, "TEST_DATABASE_URL")
+    _assert_not_production(settings.database_url, "settings.database_url")
+    engine = create_engine(_TEST_DB_URL, future=True)
     # WHY the extension has to be created BEFORE create_all: the
     # Opportunity model declares a `Vector(1536)` column (Phase 4). Its
     # CREATE TABLE emits `... jd_embedding VECTOR(1536) ...`, which the

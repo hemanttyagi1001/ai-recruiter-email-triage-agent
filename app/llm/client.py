@@ -32,6 +32,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.config import settings
 from app.llm.pricing import estimate_cost
+from app.observability.tracing import wrap_llm_client
 from app.retry import retry_external
 
 log = logging.getLogger(__name__)
@@ -144,12 +145,21 @@ class LLMClient:
         # only ever multiply. One owner for the behaviour, and it is
         # retry_external, because that is what dead-letters on exhaustion and
         # what the digest reports on.
-        self._client = AzureOpenAI(
+        azure_client = AzureOpenAI(
             api_key=settings.azure_openai_api_key,
             api_version=settings.azure_openai_api_version,
             azure_endpoint=settings.azure_openai_endpoint,
             max_retries=0,
         )
+        # TRACE: identity function unless LANGSMITH_TRACING is on, in which
+        # case this returns a wrapper that reports prompts and completions to
+        # LangSmith through the SAME redacting client the graph tracer uses.
+        # GOTCHA: the wrap must happen here, around the raw SDK object, and
+        # not around LLMClient. retry_external sits on structured_completion
+        # above this line; wrapping outside it would record one traced call
+        # per RETRY POLICY rather than one per HTTP request, and the token
+        # counts in LangSmith would stop matching the ones in `runs`.
+        self._client = wrap_llm_client(azure_client)
         self._deployment = settings.azure_openai_deployment
 
     @retry_external(node="llm_structured_completion")

@@ -158,6 +158,23 @@ class Settings(BaseSettings):
     # the reason a reply fails to reach a recruiter.
     resume_path: Path | None = Field(default=None)
 
+    # --- Observability (LangSmith) ---
+    # CONCEPT: this flag arms TRACING. It does not, and must not, control
+    # REDACTION. What gets stripped before upload is decided in
+    # app/observability/redaction.py — in code, with tests — because "recruiter
+    # PII must not reach a vendor" is the kind of constraint this project keeps
+    # out of configuration on purpose (same argument as D11 and D14: a rule
+    # that must not be violated is a validator, not a setting).
+    # WHY default false: traces are a copy of other people's mail leaving the
+    # process. Off unless someone deliberately turns it on.
+    # GOTCHA: read once at boot and cached (see tracing.get_client). Flipping
+    # this needs a restart — unlike the kill switch, which must take effect
+    # mid-run.
+    langsmith_tracing: bool = Field(default=False)
+    # Secret. .env only — never committed, same handling as the Azure key.
+    langsmith_api_key: str | None = Field(default=None)
+    langsmith_project: str = Field(default="recruiter-triage")
+
     # --- Logging ---
     log_dir: Path = Field(default=Path("logs"))
 
