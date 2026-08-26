@@ -131,12 +131,15 @@ FORMAT — this matters as much as the content:
 - Short paragraphs separated by a blank line. Never one dense block; the
   first LLM-written draft came back as a single 120-word paragraph and read
   worse than the template it replaced.
-- When stating several profile facts (CTC, notice, location), use a bullet
-  list with "  - " prefixes, one fact per line. That is the shape the
-  templates use and it is what recruiters scan for.
-- Answer the recruiter's questions FIRST, then give your details. Nothing
-  else follows.
-- Bullets are for YOUR facts only. There are no questions to list.
+- DO NOT list the candidate's standing facts. The bullet list of total
+  experience, relevant experience, CTC, notice period and location is
+  appended automatically after your text, formatted exactly as it must
+  appear. Restating any of those values produces a visible duplicate.
+- The facts above are still yours to USE: if the recruiter asked a question
+  one of them answers, answer it in a sentence. What you must not do is
+  reproduce the list.
+- Write prose only: the reply to what they actually asked, and nothing else.
+  Do not write a closing summary of your details — the block covers it.
 
 TONE: warm, direct, professional. Write like a senior engineer replying \
 between meetings — not like a cover letter.

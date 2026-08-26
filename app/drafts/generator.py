@@ -35,6 +35,7 @@ from app.llm.schemas import Opportunity
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _DECLINE_TEMPLATE = (_TEMPLATE_DIR / "decline.txt").read_text(encoding="utf-8")
 _INTERESTED_TEMPLATE = (_TEMPLATE_DIR / "interested.txt").read_text(encoding="utf-8")
+_PIVOT_TEMPLATE = (_TEMPLATE_DIR / "pivot.txt").read_text(encoding="utf-8")
 
 
 def build_decline(
@@ -86,13 +87,90 @@ def build_interested(
     return _with_signature(body, profile)
 
 
+def build_pivot(
+    parsed: ParsedMessage,
+    opp: Opportunity | None,
+    profile: CandidateProfile,
+) -> str:
+    """A redirect: not this role, but here is the work I do want, plus a CV.
+
+    CONCEPT: why an off-field role gets a third shape rather than a decline.
+      A decline ends the conversation. But a recruiter mailing about a .NET
+      vacancy is a person with a requisition list, and the reason they sent
+      the wrong role is that they do not know what you do now. Saying "not a
+      fit" teaches them nothing; saying "not this, I do AI/ML, here is my CV"
+      converts a dead thread into a standing referral.
+
+    WHY no `reason` parameter, unlike build_decline: the reason is fixed and
+    is the whole point of the shape — the role is in another field. Passing
+    the fit scorer's rationale through would leak a machine's assessment of
+    someone's own vacancy into mail they read.
+
+    GOTCHA: this template hard-codes the claim that a CV is attached, so it
+    must only ever be called on a path that forces the attachment. The score
+    node sets `resume_requested = True` in the same state update that selects
+    PIVOT, which is what makes that true. See D64 — the wording and the MIME
+    part read one flag, per the D61 invariant.
+    """
+    c = profile.candidate
+    body = _PIVOT_TEMPLATE.format(
+        salutation=_salutation(parsed, opp),
+        about_role=_about_role_clause(opp),
+        total_years=render(c.total_years),
+        relevant_years=render(c.relevant_years),
+        stack=render(c.stack),
+        notice_period=render(c.notice_period),
+        current_location=render(c.current_location),
+        preferred_location=render(c.preferred_location),
+    )
+    return _with_signature(body, profile)
+
+
+def render_facts_block(profile: CandidateProfile | None) -> str:
+    """The candidate's standing facts as a fixed bullet list.
+
+    CONCEPT: why code owns this and the model does not (D66).
+      These values are exact, and the only correct rendering of them is the
+      one candidate.toml states. A model asked to "list the facts" will
+      paraphrase, reorder, merge two bullets with a semicolon, or round a CTC
+      — all of which it did. The observed failure was total and relevant
+      experience arriving as one run-on line, but the same freedom applies to
+      the salary figure, which is a worse thing to have restated loosely.
+
+    WHY this belongs next to _with_signature rather than in llm_generator:
+      it is the same category of thing. The greeting and sign-off already
+      moved into code because a model writing its own would eventually invent
+      a phone number. The facts block is that argument applied to the numbers.
+      Both drafters now emit byte-identical blocks.
+
+    GOTCHA: renders "" when the profile is absent, so the LLM path degrades to
+    prose-only rather than raising. A reply missing its bullet list is worse
+    than one that has it and still far better than no reply.
+    """
+    if profile is None:
+        return ""
+    c = profile.candidate
+    lines = [
+        f"  - Total experience: {render(c.total_years)} years",
+        f"  - Relevant experience: {render(c.relevant_years)} years in {render(c.stack)}",
+        f"  - Current CTC: {render(c.current_ctc_lpa)} LPA · Expected: {_expected_ctc(c.expected_ctc_lpa)}",
+        f"  - Notice: {render(c.notice_period)}",
+        f"  - Location: {render(c.current_location)} · Preferred: {render(c.preferred_location)}",
+    ]
+    # WHY drop rather than print "NA": rule 2 of the system prompt tells the
+    # model to omit unknown values instead of writing the placeholder, and a
+    # code-rendered block that ignored that rule would look worse than the
+    # model's output it replaced.
+    return "\n".join(line for line in lines if NA not in line)
+
+
 def wrap_body(
     body: str,
     parsed: ParsedMessage,
     opp: Opportunity | None,
     profile: CandidateProfile | None,
 ) -> str:
-    """Put a greeting on the front and the signature on the back.
+    """Put a greeting on the front, the facts and signature on the back.
 
     WHY this is shared rather than duplicated in the LLM drafter: the greeting
     and sign-off are the candidate's identity, not the message's content, and
@@ -104,9 +182,21 @@ def wrap_body(
     GOTCHA: the first LLM-written drafts shipped without either, because this
     step existed only inside the template builders. The body looked fine in
     isolation and wrong in the mailbox.
+
+    TRACE (D66): the facts block is appended HERE, after the model's prose and
+    before the signature. The model is told the block is added automatically
+    and instructed not to restate those values, so the assembled reply reads
+    as: greeting → the model's answer to what they asked → fixed bullets →
+    signature. If the model disobeys and lists them anyway the result is a
+    visible duplicate, which is exactly the kind of failure that shows up in
+    the first draft you read rather than silently months later.
     """
     greeting = f"Hi {_salutation(parsed, opp)},"
-    return _with_signature(greeting + "\n\n" + body, profile)
+    facts = render_facts_block(profile)
+    parts = [greeting, "", body.strip("\n")]
+    if facts:
+        parts += ["", facts]
+    return _with_signature("\n".join(parts), profile)
 
 
 # --- helpers ---

@@ -50,13 +50,23 @@ def build_rules(profile: CandidateProfile) -> list[Rule]:
     # value; baking it into the rule at construction time keeps the rule
     # function signature uniform ((opp) -> verdict), which the engine loop
     # relies on.
-    return [
-        decliners.is_c2h,
+    rules: list[Rule] = []
+    # D65: C2H is the one decline that is a preference rather than a
+    # constraint, so it is the one that is configurable. Omitting it here
+    # means a C2H role falls through to the fit scorer and is judged on its
+    # merits like any other — which also means an off-field C2H role now
+    # reaches the PIVOT branch and gets a CV (D64).
+    # GOTCHA: the CTC floor still applies. C2H postings frequently quote
+    # below it, so turning this on does not mean every C2H role gets a reply.
+    if not profile.rules.allow_c2h:
+        rules.append(decliners.is_c2h)
+    rules.extend([
         decliners.make_ctc_below_floor(profile.rules.ctc_floor_lpa),
         decliners.outside_india_no_sponsorship,
         decliners.paid_placement,
         decliners.resume_service,
-    ]
+    ])
+    return rules
 
 
 def run_rules(opp: Opportunity, rules: list[Rule]) -> RuleVerdict | None:

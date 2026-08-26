@@ -1110,3 +1110,101 @@ client is constructed, specifically so this cannot drift.
 **Revisit if:** debugging extraction proves impossible without the JD text, in
 which case (b) belongs here as a SECOND replacer chosen by an explicit
 setting, never as a loosening of this one.
+
+## D64 — Off-field roles pivot to AI/ML with a CV; Naukri always attaches (2026-08-26)
+**Decision:** Three changes. (1) `candidate.stack` now reads "AI/ML & GenAI
+solution design and delivery (RAG systems, LLM integration, conversational AI
+on Azure)", and the interested template splits total/relevant experience into
+two bullets. (2) `should_attach_resume(body, from_email)` attaches whenever the
+body asks OR the sender is a naukri.com relay. (3) A new `DraftType.PIVOT`
+replaces the soft decline on the fit-score path: it declines the role, states
+the AI/ML focus, and attaches the CV.
+**Alternatives:** pivot on every decline (rejected — see the safety note);
+let the LLM write the pivot (rejected: it says one fixed thing, sends
+unsupervised, and carries an attachment, so there is nothing to gain and a
+fabricated qualification to lose — same argument that keeps declines on
+templates); rename `resume_requested` to match its widened meaning (rejected as
+churn across the graph, both send nodes and their tests for no behaviour
+change; a GOTCHA in resume_request.py carries the note instead).
+**Reason:** operator direction. A recruiter mailing the wrong role has a
+requisition list and does not know what the candidate does now; "not a fit"
+teaches them nothing, a CV plus a stated focus converts a dead thread into a
+standing referral.
+**SAFETY — why PIVOT is scoped to the fit-score path only:** it is the only
+shape that attaches a CV unasked, and `paid_placement` / `resume_service` are
+decline RULES. `_route_after_rules` sends any rule verdict straight to draft,
+so a solicitation can never reach the score node where PIVOT is set. The
+property comes from the graph edge, not from a check someone could forget —
+`test_any_rule_fire_routes_to_draft_and_never_to_the_scorer` pins the edge and
+`test_the_solicitation_rules_are_actually_in_the_rule_list` pins the premise.
+C2H, CTC-floor and outside-India also stay declines: the blocker there is
+commercial or geographic, so pitching AI/ML at the same recruiter is pointless.
+**GOTCHA kept in sync:** the pivot template asserts outright that a CV is
+attached. The score node sets `resume_requested = True` in the SAME state
+update that selects PIVOT, so the wording and the MIME part read one flag and
+cannot disagree — the D61 invariant, extended to a third shape.
+**Side effect accepted:** `stack` also feeds the fit scorer (app/scoring/fit.py),
+so scoring now favours AI/ML and marks .NET roles down. That is intended, but
+it moves the meaning of the existing `fit_threshold` — the Blue Yonder Staff
+Data Scientist that scored 60 and declined would likely clear the bar now.
+**Revisit if:** pivots draw no replies (the shape is not earning its
+attachment), or the new scoring pushes borderline roles the wrong way, which
+argues for retuning `fit_threshold` rather than reverting the profile.
+
+## D65 — C2H becomes a configurable preference, not a hard rule (2026-08-26)
+**Decision:** `[rules].allow_c2h` in candidate.toml. When true, `is_c2h` is
+omitted from `build_rules`, so a contract-to-hire role falls through to the
+fit scorer and is judged on merit. Defaults to FALSE, so an unchanged
+candidate.toml keeps the old behaviour.
+**Alternatives:** delete the rule outright (rejected — the operator said "for
+now", and deleting loses the rule, its reason string and its test, making the
+reversal a revert instead of one word); keep it and lower its precedence
+(meaningless — first-match-wins, so it either fires or it does not).
+**Reason:** operator direction. C2H was the one entry in the decline list that
+encodes an appetite rather than a constraint — the others are money,
+geography, and two kinds of solicitation. Appetite tracks the market, so it
+belongs in the profile next to `ctc_floor_lpa`, not in a Python list.
+**GOTCHA — the consequence that is not obvious from the flag's name:** with
+the rule gone, C2H reaches the score node, which is the only place `PIVOT` is
+set (D64). So an off-field C2H role now receives a CV attachment. Intended,
+but it follows from the toggle rather than being stated by it, so
+`test_c2h_reaches_the_scorer_when_the_toggle_is_on` pins it.
+**Still enforced:** the CTC floor. C2H postings frequently quote below it, so
+this does not mean every C2H role gets a reply — `is_c2h` was simply the
+first rule in the list and was shadowing the money check for these.
+**Revisit if:** C2H replies produce mostly low-ball conversations, which
+argues for a separate (higher) floor for C2H rather than re-arming the rule.
+
+## D66 — Score alone routes the reply; code owns the facts block (2026-08-26)
+**Decision:** Two changes to the reply path. (1) The score node no longer
+special-cases `uncertain` — it routes on `score >= fit_threshold` alone, so an
+uncertain low score now PIVOTs. (2) The candidate's standing facts (total and
+relevant experience, CTC, notice, location) are rendered by
+`generator.render_facts_block` and appended in `wrap_body`; the LLM is told the
+block is added automatically and instructed not to restate it.
+**Alternatives:** (1) keep the abstention branch but require score above some
+floor (rejected — two thresholds where one will do, and the second has no
+principled value); (2) tighten the prompt to forbid merging the two experience
+bullets (rejected — this was the second formatting slip, and a prompt is a
+request, not a guarantee. Same argument that moved the greeting and sign-off
+into code).
+**Reason — (1) is a chain of two decisions, not one bug:** D54 routed
+uncertain to INTERESTED because the interested template's clarifications block
+would ask for whatever the JD omitted. D61 then banned questions outright and
+`_clarifications_block` began returning "". The clarifying draft stopped
+clarifying and nothing revisited the branch that depended on it. Measured on
+live mail: 17 of 19 `interested` replies went to roles scoring BELOW threshold,
+including a QA lead role and a .NET backend role — exactly what PIVOT exists to
+prevent. `uncertain` is still computed and still persisted on
+`drafts.fit_uncertain`; it just no longer decides what a recruiter receives.
+**Reason — (2):** the model merged "Total experience" and "Relevant
+experience" onto one semicolon-joined line. The values are exact and the only
+correct rendering is the one candidate.toml states; the same latitude that
+merged two bullets applies to the CTC figure, which is a worse thing to have
+paraphrased.
+**GOTCHA:** if the model ignores the instruction and lists the facts anyway,
+the reply shows a visible duplicate block. That is deliberate — a loud failure
+in the first draft read, rather than a silent drift noticed months later.
+**Revisit if:** pivots on uncertain scores turn out to be mostly good AI/ML
+roles the scorer merely could not read, which would argue for improving the
+extractor's jd_text capture rather than restoring the abstention branch.

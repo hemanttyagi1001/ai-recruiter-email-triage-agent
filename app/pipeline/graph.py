@@ -81,7 +81,7 @@ from app.candidate import CandidateProfile
 from app.config import settings
 from app.db.models import EXTRACTABLE_CATEGORIES, Category, DraftType
 from app.dedup.nodes import make_dedup_check_node, make_embed_jd_node
-from app.drafts.generator import build_decline, build_interested, wrap_body
+from app.drafts.generator import build_decline, build_interested, build_pivot, wrap_body
 from app.drafts.llm_generator import build_llm_reply
 from app.drafts.validator import validate_draft
 from app.gmail.client import GmailClient
@@ -101,7 +101,7 @@ from app.pipeline.state import TriageState, make_event
 from app.rules.engine import build_rules, run_rules
 from app.rules.already_replied import already_replied
 from app.rules.reply_target import is_auto_responder, resolve_reply_target
-from app.rules.resume_request import is_resume_requested
+from app.rules.resume_request import should_attach_resume
 from app.scoring.fit import fit_score
 
 from langgraph.graph import END, START, StateGraph
@@ -138,10 +138,14 @@ def _make_extract_node(llm: LLMClient):
         # setting it here is what lets a portal alert terminate before paying
         # for an embedding and a fit score.
         reply_to = resolve_reply_target(parsed, opp) if opp is not None else None
-        # Read from the RAW body, not from anything the extractor produced:
-        # the request is a phrase the sender wrote, and a regex over their
-        # words cannot be talked out of its answer the way a model could.
-        resume_requested = is_resume_requested(parsed.body_text)
+        # Read from the RAW body and the RAW From header, not from anything
+        # the extractor produced: both are things the sender wrote or the
+        # relay stamped, and a regex over them cannot be talked out of its
+        # answer the way a model could.
+        # D64: Naukri relay mail attaches unconditionally — the portal's flow
+        # means the ask never appears as a sentence, but the recruiter still
+        # expects the CV.
+        resume_requested = should_attach_resume(parsed.body_text, parsed.from_email)
         # D60: one reply per recruiter. Checked here, right after the target is
         # known and before embed_jd, so a repeat message costs classify+extract
         # and nothing else.
@@ -202,32 +206,45 @@ def _make_score_node(llm: LLMClient, profile: CandidateProfile):
             "fit_score_result": result,
             "score_usage": usage,
         }
-        if result.uncertain:
-            # D54: an abstention is a request for information, not a verdict.
-            # The scorer is told to set uncertain=true when "a critical field
-            # (role, stack, CTC) is missing, or the extracted data is too
-            # vague" — that describes the JD, not the opportunity. Everything
-            # reaching this node already cleared the deterministic filters
-            # (category, C2H, CTC floor, location), so the honest reply is to
-            # ask for what the JD left out, which is exactly what the
-            # interested template's clarifications block does.
-            # WHY needs_review is NOT set: it routes _terminal_status to
-            # NEEDS_REVIEW, and this thread no longer terminates — it goes on
-            # to draft. The abstention is still recorded, on the draft row's
-            # fit_uncertain column, so nothing is lost.
-            updates["draft_type"] = DraftType.INTERESTED
-            updates["events"] = [
-                make_event("score", outcome="uncertain → clarifying draft")
-            ]
-        elif result.score >= threshold:
+        # D66: routing is on the SCORE alone. `uncertain` used to short-circuit
+        # to INTERESTED before the threshold was ever compared (D54), on the
+        # argument that an abstention is a request for information and the
+        # interested template's clarifications block would ask for what the JD
+        # left out. D61 then banned questions outright and
+        # `_clarifications_block` began returning "" — so the clarifying draft
+        # stopped clarifying, and the branch that depended on it was never
+        # revisited. Measured effect: 17 of 19 `interested` replies went to
+        # roles scoring BELOW threshold, including a QA lead and a .NET backend
+        # role, which is exactly what PIVOT exists to prevent.
+        # WHY the flag is still computed and stored: `uncertain` remains real
+        # information about the scorer's confidence — it is persisted on the
+        # draft row's fit_uncertain column and read by the digest. It simply no
+        # longer decides what shape of reply a recruiter receives.
+        # GOTCHA: an uncertain score of 0 now pivots, which is also the safer
+        # reply — it states the AI/ML focus and attaches the CV rather than
+        # claiming interest in a role nobody could assess.
+        if result.score >= threshold:
             updates["draft_type"] = DraftType.INTERESTED
             updates["events"] = [make_event("score", outcome=f"{result.score} → interested")]
         else:
-            updates["draft_type"] = DraftType.DECLINE
-            updates["draft_reason"] = (
-                "the role isn't quite the shape I'm optimising for right now"
-            )
-            updates["events"] = [make_event("score", outcome=f"{result.score} → soft decline")]
+            # D64: an off-field role is answered with a PIVOT, not a decline.
+            # TRACE: reaching this branch already proves the rules PASSED —
+            # _route_after_rules sends any rule-fired verdict straight to
+            # draft, bypassing this node entirely. That is the whole safety
+            # argument for the pivot: `paid_placement` and `resume_service`
+            # are rules, so a solicitation can never arrive here, and this is
+            # the only shape that attaches a CV unasked.
+            updates["draft_type"] = DraftType.PIVOT
+            # WHY set here rather than in the draft node: the template states
+            # outright that a CV is attached, and the SAME flag drives the
+            # MIME part in act/auto_send. Writing both from one place is what
+            # stops the wording and the attachment disagreeing (D61) — a
+            # draft node that only changed the text would produce a reply
+            # claiming an enclosure that isn't there.
+            updates["resume_requested"] = True
+            updates["events"] = [
+                make_event("score", outcome=f"{result.score} → pivot to AI/ML")
+            ]
         return updates
     return n
 
@@ -267,7 +284,17 @@ def _make_draft_node(profile: CandidateProfile, llm: LLMClient):
                 )
 
         if source == "template":
-            if draft_type == DraftType.INTERESTED:
+            if draft_type == DraftType.PIVOT:
+                # CONCEPT: the pivot stays on a template even under
+                #   DRAFT_MODE=llm, and the block above enforces that by
+                #   testing for INTERESTED specifically. A pivot says one
+                #   fixed thing — not this role, I do AI/ML, here is my CV —
+                #   and there is nothing a model can add to that except the
+                #   risk of inventing a qualification, on a reply that sends
+                #   unsupervised and carries an attachment. Same argument
+                #   that keeps declines on templates. See D64.
+                body = build_pivot(parsed, opp, profile)
+            elif draft_type == DraftType.INTERESTED:
                 # TRACE: the same flag that makes act/auto_send attach the PDF
                 # also decides the closing sentence, so the words and the MIME
                 # part can never disagree about whether a CV is enclosed.

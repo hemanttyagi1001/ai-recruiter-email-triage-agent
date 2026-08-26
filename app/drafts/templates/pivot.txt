@@ -1,0 +1,9 @@
+Hi {salutation},
+
+Thanks for reaching out{about_role}. This particular role isn't the direction I'm heading — I've moved fully into AI/ML and I'm focusing there now.
+
+  - Relevant experience: {relevant_years} years in {stack}
+  - Total experience: {total_years} years
+  - Notice: {notice_period} · Location: {current_location} · Preferred: {preferred_location}
+
+If you're hiring for AI/ML, GenAI or applied data science roles, I'd be glad to be considered — I've attached my CV so you have it on file.

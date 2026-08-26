@@ -2,7 +2,8 @@ Hi {salutation},
 
 Thanks for reaching out{about_role}. Some quick context on my side:
 
-  - Total experience: {total_years} years ({relevant_years} years in {stack})
+  - Total experience: {total_years} years
+  - Relevant experience: {relevant_years} years in {stack}
   - Current CTC: {current_ctc_lpa} LPA · Expected: {expected_ctc}
   - Notice: {notice_period}
   - Location: {current_location} · Preferred: {preferred_location}

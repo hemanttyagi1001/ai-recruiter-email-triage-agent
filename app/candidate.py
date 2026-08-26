@@ -118,6 +118,16 @@ class _Candidate(BaseModel):
 class _Rules(BaseModel):
     model_config = ConfigDict(extra="forbid")
     ctc_floor_lpa: float = Field(gt=0)
+    # WHY a toggle rather than deleting the rule: "entertain C2H" is a stance
+    # that tracks the job market and the candidate's appetite, and it flips
+    # back. A config flag keeps the rule, its reason string and its test
+    # alive so re-arming it is one word, not a revert.
+    # GOTCHA: defaults to False, i.e. C2H still declines, so an existing
+    # candidate.toml that says nothing keeps the pre-D65 behaviour. Opting
+    # into risk should require typing something.
+    # TRACE: read once by build_rules at graph-construction time, not per
+    # message — flipping it needs a restart, unlike the kill switch.
+    allow_c2h: bool = False
 
 
 class _Scoring(BaseModel):

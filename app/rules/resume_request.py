@@ -74,3 +74,42 @@ def is_resume_requested(body_text: str | None) -> bool:
     if not body_text:
         return False
     return any(p.search(body_text) for p in _PATTERNS)
+
+
+def _is_naukri_sender(from_email: str | None) -> bool:
+    """True if this arrived through Naukri's relay.
+
+    WHY the check is on the FROM header rather than on `source_platform` from
+    the extractor: the header is stamped by the relay itself and cannot be
+    influenced by the message body, while an extracted field is the model's
+    reading of text a stranger wrote. This gates an attachment, so it follows
+    the same rule as everything else on the outbound path — derive it from
+    something the sender cannot author. See D11.
+    """
+    if not from_email or "@" not in from_email:
+        return False
+    domain = from_email.strip().lower().rpartition("@")[2]
+    return domain == "naukri.com" or domain.endswith(".naukri.com")
+
+
+def should_attach_resume(body_text: str | None, from_email: str | None) -> bool:
+    """True if this reply should carry the CV.
+
+    CONCEPT: two independent reasons to attach, one flag.
+      1. The recruiter asked — `is_resume_requested` above, matching an
+         imperative in the body.
+      2. The message came through Naukri. Relay mail rarely contains an
+         explicit request because the portal's own flow is "apply and we
+         forward your profile", so the ask never appears as a sentence. The
+         recruiter on the other end still expects a CV, and by the time they
+         have to ask for one the thread has cost a round-trip.
+
+    GOTCHA: the caller stores this on `resume_requested`, whose name is now
+    narrower than its meaning — it answers "attach?", not "was it asked for?".
+    Renaming the state key would touch the graph, both send nodes and their
+    tests for no behavioural gain, so the name stays and this note exists
+    instead. What must NOT drift is the pairing: the same flag decides the
+    closing sentence and the MIME part, so they cannot contradict each other
+    (D61).
+    """
+    return is_resume_requested(body_text) or _is_naukri_sender(from_email)

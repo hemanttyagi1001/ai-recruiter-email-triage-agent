@@ -97,6 +97,18 @@ class MessageStatus(StrEnum):
 class DraftType(StrEnum):
     DECLINE = "decline"
     INTERESTED = "interested"
+    # An off-field role: decline THIS vacancy, state the AI/ML focus, and
+    # attach the CV so the recruiter can match future requisitions. Distinct
+    # from DECLINE because it is not a refusal — it is a counter-offer, and
+    # the report/digest surfaces should be able to count them apart.
+    # GOTCHA: only ever set on the fit-score path (rules passed, score below
+    # threshold). A rule-fired decline must NEVER become a pivot: two of those
+    # rules catch paid-placement and resume-service solicitations, and this
+    # shape attaches a CV. See D64.
+    # WHY no migration: draft_type is a TEXT column with a Python StrEnum
+    # (D10) precisely so adding a value stays a code-only change. "pivot" also
+    # fits the String(16) width.
+    PIVOT = "pivot"
 
 
 class DraftStatus(StrEnum):
