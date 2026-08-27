@@ -1,0 +1,5 @@
+Hi {salutation},
+
+Thanks for getting back to me. Here are the details you asked for:
+
+{answers_block}

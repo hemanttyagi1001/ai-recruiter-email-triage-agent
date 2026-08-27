@@ -76,10 +76,20 @@ class _Candidate(BaseModel):
     current_location: str | None = None
     preferred_location: str | None = None
     employment_status: str | None = None
+    # D67: asked for by name on nearly every Indian screening form, and by
+    # nothing else in the system. They exist so the questionnaire reply can
+    # answer the whole form instead of most of it — a form returned with two
+    # blanks reads as evasive on the two questions a recruiter is screening on.
+    # GOTCHA: still Optional. An unset value is omitted from the answer block,
+    # never guessed — the standing rule that a field the source does not state
+    # is null, not an invention.
+    native_location: str | None = None
+    reason_for_job_change: str | None = None
 
     @field_validator(
         "stack", "notice_period", "current_location",
         "preferred_location", "employment_status",
+        "native_location", "reason_for_job_change",
         mode="before",
     )
     @classmethod

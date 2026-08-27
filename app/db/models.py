@@ -109,6 +109,11 @@ class DraftType(StrEnum):
     # (D10) precisely so adding a value stays a code-only change. "pivot" also
     # fits the String(16) width.
     PIVOT = "pivot"
+    # A screening form answered from the profile. Distinct from INTERESTED
+    # because it expresses no view on the role — it returns facts that were
+    # asked for. Counting them apart is how "how much of my inbound is
+    # paperwork" becomes a query. See D67.
+    QUESTIONNAIRE = "questionnaire"
 
 
 class DraftStatus(StrEnum):

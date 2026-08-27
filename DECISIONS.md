@@ -1208,3 +1208,43 @@ in the first draft read, rather than a silent drift noticed months later.
 **Revisit if:** pivots on uncertain scores turn out to be mostly good AI/ML
 roles the scorer merely could not read, which would argue for improving the
 extractor's jd_text capture rather than restoring the abstention branch.
+
+## D67 — Screening forms are answered; other follow-ups still are not (2026-08-27)
+**Decision:** `followup_existing_thread` re-enters the pipeline in exactly one
+case: the body is a screening form. `rules/questionnaire.py` counts known
+field labels ("Current CTC:", "Notice Period:", …) and admits the message only
+at MIN_FIELDS=3 or more. It routes to a new `questionnaire` node — no extract,
+no embed, no dedup, no rules, no fit score — which sets `DraftType.QUESTIONNAIRE`
+and the ordered field list, then rejoins the normal pipeline at `draft`.
+**Alternatives:** reopen follow-ups generally (rejected — that is D55, and it
+produced non-sequiturs on negotiations, rejections and closures); ask the LLM
+"is this a questionnaire?" (rejected — it gates a send, so D11 applies, and
+the trigger text is written by a stranger who can assert that it is one);
+answer with the full standing-facts block regardless of what was asked
+(rejected — these get pasted field-by-field into an ATS, so the sender's own
+order and labels turn a hunt into a copy).
+**Reason:** D55's real constraint was never the category label — it was that
+the agent cannot answer a question whose meaning depends on thread history it
+cannot see. A form asking "Current CTC:" depends on no history at all; the
+answers are standing facts. D55's own comment names the skipped screening
+questionnaire as a known casualty. Observed live on 2026-08-26: a TekWissen
+recruiter sent a nine-field form and it was dropped as
+`skipped_wrong_category` — the easiest email in the inbox to answer, since
+seven of the nine values were already in candidate.toml.
+**Both conditions must hold.** Category alone reopens D55 wholesale; content
+alone diverts a new role pitch that happens to list three labels away from
+extraction and scoring. The negative tests pin all three cases.
+**GOTCHA the real message taught us:** the form wrote
+`Notice Period (If currently not working, please mention last working day):`.
+A pattern demanding a colon directly after the label missed the single field
+recruiters care most about. Patterns now allow a parenthetical between label
+and colon. The first version was tuned on invented samples and got the only
+real one wrong — which is why FORM in the tests is the anonymised original.
+**Unanswerable fields are DROPPED, never guessed or rendered "NA".** "NA"
+beside Expected CTC reads as evasive on the exact question being screened for;
+an invented value puts words in the candidate's mouth to someone who will hold
+them to it. Two new optional profile fields (`native_location`,
+`reason_for_job_change`) exist so the common form can be answered in full.
+**No CV attached:** a follow-up thread means they already have it.
+**Revisit if:** false positives appear (a JD template listing three labels),
+which argues for raising MIN_FIELDS rather than adding prose heuristics.

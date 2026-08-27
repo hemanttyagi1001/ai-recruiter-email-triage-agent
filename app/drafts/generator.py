@@ -36,6 +36,7 @@ _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _DECLINE_TEMPLATE = (_TEMPLATE_DIR / "decline.txt").read_text(encoding="utf-8")
 _INTERESTED_TEMPLATE = (_TEMPLATE_DIR / "interested.txt").read_text(encoding="utf-8")
 _PIVOT_TEMPLATE = (_TEMPLATE_DIR / "pivot.txt").read_text(encoding="utf-8")
+_QUESTIONNAIRE_TEMPLATE = (_TEMPLATE_DIR / "questionnaire.txt").read_text(encoding="utf-8")
 
 
 def build_decline(
@@ -122,6 +123,70 @@ def build_pivot(
         notice_period=render(c.notice_period),
         current_location=render(c.current_location),
         preferred_location=render(c.preferred_location),
+    )
+    return _with_signature(body, profile)
+
+
+def build_questionnaire(
+    parsed: ParsedMessage,
+    profile: CandidateProfile,
+    fields: list[str],
+    opp: Opportunity | None = None,
+) -> str:
+    """Answer a screening form, echoing only the fields it actually asked for.
+
+    CONCEPT: answer their form, not ours (D67).
+      The obvious implementation dumps the whole standing-facts block and lets
+      the recruiter find what they wanted. That is worse than it sounds: these
+      forms get pasted field-by-field into an ATS, so a reply in the sender's
+      own order and wording is a copy job, while a reply in ours is a hunt.
+      `fields` arrives from `questionnaire.detect_fields` already ordered by
+      where each label appeared in their message.
+
+    GOTCHA: a field we hold no value for is DROPPED, never guessed and never
+      rendered as "NA". Two failure modes are being avoided at once — writing
+      "NA" next to "Expected CTC" reads as evasive on the exact question they
+      are screening for, and inventing a plausible value puts words in the
+      candidate's mouth to someone who will hold them to it. Dropping means
+      the reply is visibly incomplete, which is honest and is the one outcome
+      a human can still fix.
+    """
+    answers = {
+        "Current Location": render(profile.candidate.current_location),
+        "Native Location": render(profile.candidate.native_location),
+        "Total Experience": f"{render(profile.candidate.total_years)} years",
+        "Relevant Experience": (
+            f"{render(profile.candidate.relevant_years)} years in "
+            f"{render(profile.candidate.stack)}"
+        ),
+        "Preferred Location": render(profile.candidate.preferred_location),
+        "Reason for Job Change": render(profile.candidate.reason_for_job_change),
+        "Notice Period": render(profile.candidate.notice_period),
+        "Current CTC": f"{render(profile.candidate.current_ctc_lpa)} LPA",
+        "Expected CTC": _expected_ctc(profile.candidate.expected_ctc_lpa),
+        # WHY this maps to notice period: "last working day" is what the form
+        # asks when it assumes you have already left. Answering with the
+        # notice period is the truthful response for someone still employed,
+        # and `employment_status` is what makes that unambiguous — so it is
+        # appended rather than substituted.
+        "Last Working Day": (
+            f"{render(profile.candidate.employment_status)} — "
+            f"{render(profile.candidate.notice_period)} notice"
+        ),
+    }
+    lines = []
+    for label in fields:
+        value = answers.get(label)
+        if value is None or NA in value:
+            continue
+        lines.append(f"  - {label}: {value}")
+    if not lines:
+        # Nothing answerable. The caller should not have routed here, but a
+        # reply consisting of a greeting and an empty list is worse than none.
+        raise ValueError("questionnaire draft has no answerable fields")
+    body = _QUESTIONNAIRE_TEMPLATE.format(
+        salutation=_salutation(parsed, opp),
+        answers_block="\n".join(lines),
     )
     return _with_signature(body, profile)
 

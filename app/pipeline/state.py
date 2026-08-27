@@ -148,6 +148,11 @@ class TriageState(TypedDict, total=False):
     # decide whether to attach the resume, and by the draft node to word the
     # closing line accordingly.
     resume_requested: bool
+    # D67: canonical field labels a screening form asked for, in the order it
+    # asked. Set only on the questionnaire path; empty everywhere else. The
+    # ordering is load-bearing — it is what makes the reply paste-able into
+    # the recruiter's ATS field by field.
+    questionnaire_fields: list[str]
 
     # True when this recruiter has already been sent a reply (D60). Terminates
     # the message before any scoring or drafting spend.

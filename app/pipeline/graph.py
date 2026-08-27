@@ -81,7 +81,13 @@ from app.candidate import CandidateProfile
 from app.config import settings
 from app.db.models import EXTRACTABLE_CATEGORIES, Category, DraftType
 from app.dedup.nodes import make_dedup_check_node, make_embed_jd_node
-from app.drafts.generator import build_decline, build_interested, build_pivot, wrap_body
+from app.drafts.generator import (
+    build_decline,
+    build_interested,
+    build_pivot,
+    build_questionnaire,
+    wrap_body,
+)
 from app.drafts.llm_generator import build_llm_reply
 from app.drafts.validator import validate_draft
 from app.gmail.client import GmailClient
@@ -101,6 +107,7 @@ from app.pipeline.state import TriageState, make_event
 from app.rules.engine import build_rules, run_rules
 from app.rules.already_replied import already_replied
 from app.rules.reply_target import is_auto_responder, resolve_reply_target
+from app.rules.questionnaire import detect_fields, is_profile_questionnaire
 from app.rules.resume_request import should_attach_resume
 from app.scoring.fit import fit_score
 
@@ -173,6 +180,56 @@ def _make_extract_node(llm: LLMClient):
             "events": [make_event("extract", outcome=outcome)],
         }
     return n
+
+
+def _make_questionnaire_node():
+    """Prepare a screening-form reply. No LLM, no extraction, no scoring.
+
+    TRACE: reached only from _route_after_classify when the category is
+    followup_existing_thread AND the body is a form. Sets the three things the
+    draft node needs — draft_type, the fields to answer, and a reply target —
+    then hands straight to draft. Nothing here costs an API call.
+    """
+    def n(state: TriageState) -> dict:
+        parsed = state["parsed"]
+        fields = detect_fields(parsed.body_text)
+        # WHY resolve_reply_target with opportunity=None: there is no
+        # extracted opportunity on this path, so the target can only come from
+        # the From header. That is correct here — a follow-up arrives in an
+        # existing thread with the recruiter's real address on it, which is
+        # precisely why it needs no body-scraped fallback.
+        reply_to = resolve_reply_target(parsed, None)
+        if reply_to is not None and is_auto_responder(parsed.subject):
+            reply_to = None
+        # D60 still applies: if this address already got a reply, stop. A
+        # recruiter who sends a form after we answered them already has the
+        # facts.
+        replied = already_replied(reply_to)
+        return {
+            "draft_type": DraftType.QUESTIONNAIRE,
+            "questionnaire_fields": fields,
+            "reply_to": reply_to,
+            "already_replied": replied,
+            # GOTCHA: deliberately False. A follow-up thread means the
+            # recruiter already has the CV — that is how the conversation
+            # started. Re-attaching it is the "offering what they can already
+            # see" tell that _closing exists to avoid.
+            "resume_requested": False,
+            "events": [make_event(
+                "questionnaire", outcome=f"form with {len(fields)} field(s)"
+            )],
+        }
+    return n
+
+
+def _route_after_questionnaire(state: TriageState) -> str:
+    # No mailbox to answer, or we already answered this person: stop before
+    # drafting. Same two guards the extract path applies, for the same reasons.
+    if state.get("reply_to") is None or state.get("already_replied"):
+        return "persist_terminal"
+    if not state.get("questionnaire_fields"):
+        return "persist_terminal"
+    return "draft"
 
 
 def _make_rules_node(profile: CandidateProfile):
@@ -284,7 +341,16 @@ def _make_draft_node(profile: CandidateProfile, llm: LLMClient):
                 )
 
         if source == "template":
-            if draft_type == DraftType.PIVOT:
+            if draft_type == DraftType.QUESTIONNAIRE:
+                # CONCEPT: a form is answered by a table of the candidate's own
+                #   facts. There is nothing for a model to contribute except a
+                #   chance of restating a salary figure loosely — the same
+                #   reasoning that moved the facts block into code in D66,
+                #   applied to a reply that is nothing BUT facts.
+                body = build_questionnaire(
+                    parsed, profile, state.get("questionnaire_fields") or [], opp
+                )
+            elif draft_type == DraftType.PIVOT:
                 # CONCEPT: the pivot stays on a template even under
                 #   DRAFT_MODE=llm, and the block above enforces that by
                 #   testing for INTERESTED specifically. A pivot says one
@@ -354,9 +420,24 @@ def _route_after_classify(state: TriageState) -> str:
     if cat is None:
         return "persist_terminal"
     try:
-        return "extract" if Category(cat) in EXTRACTABLE_CATEGORIES else "persist_terminal"
+        category = Category(cat)
     except ValueError:
         return "persist_terminal"
+    if category in EXTRACTABLE_CATEGORIES:
+        return "extract"
+    # D67: the one follow-up worth answering without thread history. BOTH
+    # conditions must hold — the classifier called it a follow-up AND the body
+    # is a form asking for standing facts. Category alone would reopen D55
+    # wholesale; content alone would divert a new role pitch that happens to
+    # list three labels away from extraction and scoring.
+    # TRACE: this path skips extract, embed_jd, dedup_check, rules and score
+    # entirely. There is no role being pitched, so there is nothing to extract
+    # or score — the questionnaire node sets what draft needs and hands over.
+    if category is Category.FOLLOWUP_EXISTING_THREAD:
+        parsed = state["parsed"]
+        if is_profile_questionnaire(parsed.body_text):
+            return "questionnaire"
+    return "persist_terminal"
 
 
 def _route_after_extract(state: TriageState) -> str:
@@ -493,6 +574,7 @@ def build_graph(
     g.add_node("extract", _make_extract_node(llm))
     g.add_node("embed_jd", make_embed_jd_node(llm, profile))
     g.add_node("dedup_check", make_dedup_check_node(profile))
+    g.add_node("questionnaire", _make_questionnaire_node())
     g.add_node("rules", _make_rules_node(profile))
     g.add_node("score", _make_score_node(llm, profile))
     g.add_node("draft", _make_draft_node(profile, llm))
@@ -510,7 +592,14 @@ def build_graph(
     g.add_conditional_edges("ingest", _route_after_ingest,
                             {"classify": "classify", "persist_terminal": "persist_terminal"})
     g.add_conditional_edges("classify", _route_after_classify,
-                            {"extract": "extract", "persist_terminal": "persist_terminal"})
+                            {"extract": "extract",
+                             "questionnaire": "questionnaire",
+                             "persist_terminal": "persist_terminal"})
+    # D67: the questionnaire path rejoins the normal pipeline at `draft`, so
+    # validation, the autonomy fork and every persist path are shared. A reply
+    # to a form goes through the same outbound validator as everything else.
+    g.add_conditional_edges("questionnaire", _route_after_questionnaire,
+                            {"draft": "draft", "persist_terminal": "persist_terminal"})
     g.add_conditional_edges("extract", _route_after_extract,
                             {"embed_jd": "embed_jd", "persist_terminal": "persist_terminal"})
     # Phase 4 dedup pass: extract → embed_jd → dedup_check → rules.
