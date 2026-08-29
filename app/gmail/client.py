@@ -82,6 +82,16 @@ log = logging.getLogger(__name__)
 SCOPES: list[str] = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
+    # D68: needed by mark_read — removing the UNREAD label is a messages.modify
+    # call, which neither readonly nor compose grants. Kept alongside the other
+    # two rather than replacing readonly: the three are requested together and
+    # the D40 lesson was that swapping one for another breaks a capability
+    # nobody was watching.
+    # GOTCHA: adding this line invalidated every existing token.json. Google
+    # issues tokens against the scopes actually consented to, so an old file
+    # keeps failing with insufficientPermissions no matter what this list says.
+    # Delete token.json and re-run `python -m app.gmail.auth`.
+    "https://www.googleapis.com/auth/gmail.modify",
 ]
 
 # System label IDs Gmail hard-codes. Names == IDs for these; for user-created
@@ -328,6 +338,44 @@ class GmailClient:
 
     def profile(self) -> dict:
         return self.service.users().getProfile(userId="me").execute()
+
+    def mark_read(self, gmail_id: str) -> bool:
+        """Remove the UNREAD label from a message. True if Gmail confirmed it.
+
+        CONCEPT: this is the only method here that NEVER raises (D68).
+          Every other call on this client is load-bearing — a failure to fetch
+          or send is a real failure and the caller must hear about it. Marking
+          read is bookkeeping that happens AFTER an email has already been
+          delivered, and delivery cannot be undone. If this threw, the
+          exception would climb into the ingest CLI's per-message handler,
+          which dead-letters the message; a later re-ingest would then see no
+          record and send the recruiter a second copy. That trades a cosmetic
+          problem for the exact duplicate-reply failure this project has been
+          burned by.
+
+        TRACE: one POST to users().messages().modify per successful send, and
+        only on the send path — skipped messages keep their unread state by
+        deliberate choice, so the inbox still shows what the agent ignored.
+
+        GOTCHA: requires the gmail.modify scope. On a token issued before D68
+        this returns False and logs, rather than failing the run — which is
+        exactly what you want during the window between deploying the code and
+        re-running the consent flow.
+        """
+        try:
+            self.service.users().messages().modify(
+                userId="me", id=gmail_id, body={"removeLabelIds": ["UNREAD"]}
+            ).execute()
+            return True
+        except Exception as exc:
+            log.warning(
+                "mark_read failed for gmail_id=%s (%s: %s); the reply was "
+                "already sent, so continuing. If this says "
+                "insufficientPermissions, delete token.json and re-run "
+                "`python -m app.gmail.auth` to consent to gmail.modify.",
+                gmail_id, type(exc).__name__, exc,
+            )
+            return False
 
     @retry_external(node="gmail_create_draft")
     def create_draft(

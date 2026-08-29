@@ -236,17 +236,17 @@ def test_confident_low_score_pivots():
 # --- D66: the facts block is code-rendered -----------------------------------
 
 
-def test_experience_renders_as_two_separate_bullets():
+def test_experience_renders_as_two_separate_lines():
     """Bug B: the LLM merged these into one line with a semicolon."""
     from app.drafts.generator import render_facts_block
 
     block = render_facts_block(load_profile())
     lines = [ln.strip() for ln in block.splitlines()]
-    total = [ln for ln in lines if ln.startswith("- Total experience")]
-    relevant = [ln for ln in lines if ln.startswith("- Relevant experience")]
+    total = [ln for ln in lines if ln.startswith("Total Experience:")]
+    relevant = [ln for ln in lines if ln.startswith("Relevant Experience:")]
     assert len(total) == 1 and len(relevant) == 1
     # The two must be on DIFFERENT lines — that is the whole bug.
-    assert block.index("Total experience") < block.index("Relevant experience")
+    assert block.index("Total Experience") < block.index("Relevant Experience")
     assert "years; relevant" not in block.lower()
 
 
@@ -255,8 +255,8 @@ def test_wrap_body_appends_the_facts_after_the_prose(parsed_factory):
 
     profile = load_profile()
     out = wrap_body("Yes, I'm available to talk Thursday.", parsed_factory(), _opp(), profile)
-    assert out.index("available to talk") < out.index("Total experience")
-    assert out.index("Total experience") < out.index(profile.drafts.signature.strip("\n"))
+    assert out.index("available to talk") < out.index("Total Experience")
+    assert out.index("Total Experience") < out.index(profile.drafts.signature.strip("\n"))
 
 
 def test_facts_block_survives_a_missing_profile():

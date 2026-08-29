@@ -46,6 +46,22 @@ name = "FILL-ME: Your Full Name"
 # preferred_location = "Delhi NCR or remote"
 # employment_status = "Currently employed"
 
+# Screening-form answers. Every one of these is a label Indian recruiter
+# forms ask for by name, and they exist so the agent can return a completed
+# form rather than a mostly-completed one — two blanks on a six-field form
+# reads as evasive on exactly the two questions being screened for.
+#
+# GOTCHA: the two yes/no ones are strings, not booleans, on purpose. The
+# honest answer is frequently not a bare "Yes" — "Yes, weekday evenings" and
+# "Remote, or Delhi NCR on a hybrid" are real answers a bool cannot hold.
+# Whatever you type here is quoted into the reply verbatim, so write the
+# sentence you would actually send.
+# native_location = "Delhi NCR"           # asked separately from current
+# reason_for_job_change = "Career growth, and a move to a team focused on AI"
+# current_company = "I will share this on a call"   # or your employer's name
+# interview_availability = "Yes"          # "Available for interview:"
+# remote_preference = "Yes"               # "Interested in remote:"
+
 [rules]
 # ctc_max below this floor → deterministic decline (D-decliner in engine).
 # Independent of expected_ctc so you can quietly entertain lower offers if

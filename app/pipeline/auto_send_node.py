@@ -232,6 +232,36 @@ def make_auto_send_node(gmail: GmailClient):
             gmail_sent_id, parsed.message_id,
             state.get("rule_verdict").rule_name if state.get("rule_verdict") else "?",
         )
+        # D68: mark the INBOUND message read, now that it has been answered.
+        # TRACE: ordered strictly after the send, and only on this path. The
+        # dry_run and draft branches above have already returned, so nothing
+        # is marked read unless a real email actually left the building —
+        # "read" in the inbox means "answered", not "looked at".
+        # GOTCHA: parsed.gmail_id, NOT parsed.message_id. modify() addresses
+        # messages by Gmail's internal id; the RFC 5322 Message-ID is our
+        # primary key (D2) and Gmail's API does not accept it.
+        # WHY a second guard when GmailClient.mark_read already swallows
+        # everything: that promise lives in another module, and this call site
+        # is the one that must not fail. A fake in a test, a future refactor,
+        # or a client swapped for another provider need only raise once to
+        # dead-letter a message whose reply was already delivered — and the
+        # next ingest would then send a duplicate. The cost of the redundancy
+        # is four lines; the cost of trusting the contract is a second email
+        # to a recruiter.
+        try:
+            marked = gmail.mark_read(parsed.gmail_id)
+        except Exception:
+            log.exception(
+                "mark_read raised for gmail_id=%s after a SUCCESSFUL send; "
+                "swallowing so the delivered reply is not dead-lettered",
+                parsed.gmail_id,
+            )
+            marked = False
+        if not marked:
+            log.info(
+                "reply sent for message_id=%s but it could not be marked read; "
+                "it stays unread in the inbox", parsed.message_id,
+            )
         duration_ms = int((time.monotonic() - started) * 1000)
         return {
             "gmail_sent_id": gmail_sent_id,
@@ -239,7 +269,10 @@ def make_auto_send_node(gmail: GmailClient):
             "events": [
                 make_event(
                     "auto_send",
-                    outcome=f"sent gmail_id={gmail_sent_id}",
+                    outcome=(
+                        f"sent gmail_id={gmail_sent_id}"
+                        + ("" if marked else "; mark_read failed")
+                    ),
                     duration_ms=duration_ms,
                 )
             ],

@@ -26,6 +26,7 @@ here rather than written into the .txt files.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 from app.candidate import NA, CandidateProfile, render
@@ -151,35 +152,7 @@ def build_questionnaire(
       the reply is visibly incomplete, which is honest and is the one outcome
       a human can still fix.
     """
-    answers = {
-        "Current Location": render(profile.candidate.current_location),
-        "Native Location": render(profile.candidate.native_location),
-        "Total Experience": f"{render(profile.candidate.total_years)} years",
-        "Relevant Experience": (
-            f"{render(profile.candidate.relevant_years)} years in "
-            f"{render(profile.candidate.stack)}"
-        ),
-        "Preferred Location": render(profile.candidate.preferred_location),
-        "Reason for Job Change": render(profile.candidate.reason_for_job_change),
-        "Notice Period": render(profile.candidate.notice_period),
-        "Current CTC": f"{render(profile.candidate.current_ctc_lpa)} LPA",
-        "Expected CTC": _expected_ctc(profile.candidate.expected_ctc_lpa),
-        # WHY this maps to notice period: "last working day" is what the form
-        # asks when it assumes you have already left. Answering with the
-        # notice period is the truthful response for someone still employed,
-        # and `employment_status` is what makes that unambiguous — so it is
-        # appended rather than substituted.
-        "Last Working Day": (
-            f"{render(profile.candidate.employment_status)} — "
-            f"{render(profile.candidate.notice_period)} notice"
-        ),
-    }
-    lines = []
-    for label in fields:
-        value = answers.get(label)
-        if value is None or NA in value:
-            continue
-        lines.append(f"  - {label}: {value}")
+    lines = render_answer_lines(profile, fields)
     if not lines:
         # Nothing answerable. The caller should not have routed here, but a
         # reply consisting of a greeting and an empty list is worse than none.
@@ -191,8 +164,67 @@ def build_questionnaire(
     return _with_signature(body, profile)
 
 
-def render_facts_block(profile: CandidateProfile | None) -> str:
-    """The candidate's standing facts as a fixed bullet list.
+def _answer_table(profile: CandidateProfile) -> dict[str, str]:
+    """Every canonical form label mapped to the candidate's answer for it.
+
+    One table, both drafters. Before D68 the questionnaire path and the LLM
+    path each had their own renderer, which is how a single reply came to
+    state the CTC twice in two different formats.
+    """
+    c = profile.candidate
+    return {
+        "Current Location": render(c.current_location),
+        "Native Location": render(c.native_location),
+        "Total Experience": f"{render(c.total_years)} years",
+        "Relevant Experience": (
+            f"{render(c.relevant_years)} years in {render(c.stack)}"
+        ),
+        "Preferred Location": render(c.preferred_location),
+        "Reason for Job Change": render(c.reason_for_job_change),
+        "Notice Period": render(c.notice_period),
+        "Current CTC": f"{render(c.current_ctc_lpa)} LPA",
+        "Expected CTC": _expected_ctc(c.expected_ctc_lpa),
+        # WHY this maps to notice period: "last working day" is what the form
+        # asks when it assumes you have already left. Answering with the
+        # notice period is the truthful response for someone still employed,
+        # and `employment_status` is what makes that unambiguous — so it is
+        # appended rather than substituted.
+        "Last Working Day": (
+            f"{render(c.employment_status)} — {render(c.notice_period)} notice"
+        ),
+        "Current Company": render(c.current_company),
+        "Available for Interview": render(c.interview_availability),
+        "Interested in Remote": render(c.remote_preference),
+    }
+
+
+# GOTCHA: a label the detector can produce with no entry in the answer table
+# renders nothing, and a table entry no pattern can produce is dead code.
+# Neither is visible at runtime — the reply is just quietly missing a line —
+# which is why test_questionnaire reconciles the two vocabularies directly
+# against `questionnaire.FIELD_LABELS` rather than trusting them to stay in
+# step. Adding a pattern there without an answer here is the failure it
+# catches.
+
+# The subset rendered when the recruiter did NOT send a form, and the order
+# they appear in. These are the facts worth volunteering unasked; the rest of
+# the table (native location, reason for change, last working day) is only
+# offered when something explicitly asks.
+DEFAULT_FACT_LABELS: tuple[str, ...] = (
+    "Total Experience",
+    "Relevant Experience",
+    "Current Location",
+    "Preferred Location",
+    "Current CTC",
+    "Expected CTC",
+    "Notice Period",
+)
+
+
+def render_answer_lines(
+    profile: CandidateProfile, labels: Sequence[str]
+) -> list[str]:
+    """Render `labels` as "Label: value" lines, dropping the unanswerable.
 
     CONCEPT: why code owns this and the model does not (D66).
       These values are exact, and the only correct rendering of them is the
@@ -202,6 +234,43 @@ def render_facts_block(profile: CandidateProfile | None) -> str:
       experience arriving as one run-on line, but the same freedom applies to
       the salary figure, which is a worse thing to have restated loosely.
 
+    CONCEPT: one field per line, and no alignment padding (D68).
+      The previous block packed two fields onto one line — "Current CTC: 26
+      LPA · Expected: 36 LPA" — which is fine to read and wrong to use. These
+      answers get pasted into an ATS one field at a time, so a line holding
+      two of them has to be split by hand every single time.
+    GOTCHA: do not be tempted to pad the labels into aligned columns. The
+      outbound MIME carries a text/plain part AND an HTML part that is a
+      proportional-font `pre-wrap` div (gmail/client.py). Space padding aligns
+      in the plain part and comes out ragged in the HTML one — which is the
+      part most recipients actually see.
+
+    GOTCHA: a label with no value is DROPPED, never rendered as "NA". Rule 2
+      of the LLM system prompt tells the model to omit unknown values rather
+      than write the placeholder; a code-rendered block that ignored its own
+      rule would look worse than the model output it replaced.
+    """
+    table = _answer_table(profile)
+    lines = []
+    for label in labels:
+        value = table.get(label)
+        if value is None or NA in value:
+            continue
+        lines.append(f"{label}: {value}")
+    return lines
+
+
+def render_facts_block(
+    profile: CandidateProfile | None, labels: Sequence[str] | None = None
+) -> str:
+    """The standing-facts block appended below an LLM-written reply.
+
+    WHY `labels` is a parameter rather than a constant (D68): when the
+    recruiter's email is itself a screening form, the right block is the
+    answers to THEIR fields in THEIR order — the same thing the questionnaire
+    path already builds. Passing None means they asked nothing in particular,
+    so the default subset is volunteered instead.
+
     WHY this belongs next to _with_signature rather than in llm_generator:
       it is the same category of thing. The greeting and sign-off already
       moved into code because a model writing its own would eventually invent
@@ -209,24 +278,14 @@ def render_facts_block(profile: CandidateProfile | None) -> str:
       Both drafters now emit byte-identical blocks.
 
     GOTCHA: renders "" when the profile is absent, so the LLM path degrades to
-    prose-only rather than raising. A reply missing its bullet list is worse
-    than one that has it and still far better than no reply.
+    prose-only rather than raising. A reply missing its list is worse than one
+    that has it and still far better than no reply.
     """
     if profile is None:
         return ""
-    c = profile.candidate
-    lines = [
-        f"  - Total experience: {render(c.total_years)} years",
-        f"  - Relevant experience: {render(c.relevant_years)} years in {render(c.stack)}",
-        f"  - Current CTC: {render(c.current_ctc_lpa)} LPA · Expected: {_expected_ctc(c.expected_ctc_lpa)}",
-        f"  - Notice: {render(c.notice_period)}",
-        f"  - Location: {render(c.current_location)} · Preferred: {render(c.preferred_location)}",
-    ]
-    # WHY drop rather than print "NA": rule 2 of the system prompt tells the
-    # model to omit unknown values instead of writing the placeholder, and a
-    # code-rendered block that ignored that rule would look worse than the
-    # model's output it replaced.
-    return "\n".join(line for line in lines if NA not in line)
+    return "\n".join(
+        render_answer_lines(profile, labels or DEFAULT_FACT_LABELS)
+    )
 
 
 def wrap_body(
@@ -234,6 +293,7 @@ def wrap_body(
     parsed: ParsedMessage,
     opp: Opportunity | None,
     profile: CandidateProfile | None,
+    fact_labels: Sequence[str] | None = None,
 ) -> str:
     """Put a greeting on the front, the facts and signature on the back.
 
@@ -251,13 +311,21 @@ def wrap_body(
     TRACE (D66): the facts block is appended HERE, after the model's prose and
     before the signature. The model is told the block is added automatically
     and instructed not to restate those values, so the assembled reply reads
-    as: greeting → the model's answer to what they asked → fixed bullets →
+    as: greeting → the model's answer to what they asked → the answer block →
     signature. If the model disobeys and lists them anyway the result is a
     visible duplicate, which is exactly the kind of failure that shows up in
     the first draft you read rather than silently months later.
+
+    TRACE (D68): `fact_labels` is what the recruiter's own form asked for,
+    detected by `questionnaire.detect_fields` and passed down from the draft
+    node. It changes WHICH facts the block carries and in what order — their
+    fields in their order when they sent a form, the default subset when they
+    did not. The duplicate this fixes was not the model misbehaving: a form
+    email put rules 9 and FORMAT of the system prompt in direct conflict, and
+    answering the form was the correct half to obey.
     """
     greeting = f"Hi {_salutation(parsed, opp)},"
-    facts = render_facts_block(profile)
+    facts = render_facts_block(profile, fact_labels)
     parts = [greeting, "", body.strip("\n")]
     if facts:
         parts += ["", facts]

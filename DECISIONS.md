@@ -1248,3 +1248,54 @@ them to it. Two new optional profile fields (`native_location`,
 **No CV attached:** a follow-up thread means they already have it.
 **Revisit if:** false positives appear (a JD template listing three labels),
 which argues for raising MIN_FIELDS rather than adding prose heuristics.
+
+## D68 — One answer table for both drafters; the block follows their form
+
+**Decision:** `render_facts_block` and `build_questionnaire` now share a single
+`_answer_table` and a single `render_answer_lines`, rendering one
+`Label: value` per line with no bullets, no `·`-joined pairs and no alignment
+padding. On the LLM path the draft node runs `detect_fields` over the
+recruiter's body and passes the result to BOTH `build_llm_reply` ("these are
+already answered, do not write them") and `wrap_body` ("render exactly these,
+in this order"). Three profile fields were added — `current_company`,
+`interview_availability`, `remote_preference`.
+
+**The bug:** a recruiter pitched a role AND appended a screening form. That
+classifies as `new_role_pitch`, so it took the extract/score/INTERESTED path
+and never reached `build_questionnaire`. The model answered the form in prose;
+code then appended the fixed facts block underneath. CTC, notice and location
+went out twice, in two different formats.
+
+**Root cause, and why the prompt was not the fix:** system-prompt rule 9
+("answering what they asked IS the reply") and the FORMAT rule ("never list
+the standing facts") are in direct contradiction when the email *is* a list of
+standing-fact questions. The model obeyed the correct half. Per the standing
+rule that a constraint which must not be violated lives in code, the fix moves
+the decision out of the prompt: the model is handed the literal list of labels
+the appended block will contain, which is checkable rather than a judgement.
+
+**Alternatives rejected:** (a) strengthen the FORMAT wording — leaves the
+contradiction intact and stakes the outcome on which rule the model weights
+more that day; (b) route pitch-plus-form messages to the questionnaire path —
+throws away extraction, dedup and fit scoring for a message that really is a
+role pitch; (c) strip duplicated facts from the model's prose post-hoc —
+string-matching a paraphrase, and it would leave the sentence mangled.
+
+**Why the new fields are strings, not bools:** the honest answer to "available
+for interview" is often "Yes, weekday evenings". A bool rounds that into a
+lie. Whatever is in candidate.toml is quoted verbatim.
+
+**GOTCHA fixed in passing:** `_COMPILED` built patterns as `pattern + _COLON`.
+`|` binds looser than concatenation, so any pattern with a top-level
+alternation would have lost the colon requirement on its first branch — the
+single character doing most of the discrimination in that module. Patterns are
+now wrapped in their own group before the colon is appended.
+
+**GOTCHA on formatting:** do not pad labels into aligned columns. The outbound
+MIME carries a text/plain part and an HTML part that is a proportional-font
+`pre-wrap` div, so padding aligns in one and comes out ragged in the other —
+and the HTML part is what most recipients see.
+
+**Revisit if:** the `fact_labels` sequence ever reaches `build_llm_reply` and
+`wrap_body` differently. They are two halves of one contract and the duplicate
+returns the moment they disagree.
