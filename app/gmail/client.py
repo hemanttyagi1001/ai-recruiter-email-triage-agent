@@ -6,14 +6,19 @@ payload, put this draft in the Drafts folder." It exists as one module so
 that every mailbox capability the system holds is enumerable by reading a
 single file.
 
-Capability, stated honestly: this client can READ any message and can WRITE
-(create drafts, send replies). It holds `gmail.readonly` + `gmail.compose`.
-It cannot modify labels or trash mail — no scope here grants that. An
+Capability, stated honestly: this client can READ any message, can WRITE
+(create drafts, send replies), and since D68 can also remove the UNREAD
+label. It requests `gmail.readonly` + `gmail.compose` + `gmail.modify`. An
 earlier version of this docstring claimed the client was "structurally
 incapable of sending"; that stopped being true when Phase 2 added
-create_draft and Phase 5 added send_reply. The restraint is now a CODE
-property enforced at the call sites and by the kill switch, NOT an OAuth
-property. See the SCOPES block below, D33, D36, and D40.
+create_draft and Phase 5 added send_reply, and its claim that no scope
+granted label mutation stopped being true at D68. The restraint is now a
+CODE property enforced at the call sites and by the kill switch, NOT an
+OAuth property. See the SCOPES block below, D33, D36, D40 and D69.
+
+The three scopes are NOT equally load-bearing: readonly and compose are
+required, modify is optional and degrades to a no-op. D69 explains why that
+distinction is enforced in code rather than left to convention.
 
 Trust boundary note: this module reads untrusted email content but has no LLM
 dependency and does not itself act on the content. It only turns Gmail API
@@ -79,20 +84,40 @@ log = logging.getLogger(__name__)
 # issues tokens against the scopes consented to, not the scopes requested
 # later, so a stale token keeps failing with insufficientPermissions until
 # the file is deleted and the consent flow re-run.
-SCOPES: list[str] = [
+# CONCEPT: required vs. optional scopes, and why the distinction is load-bearing.
+#   D69 splits this list in two. A scope is REQUIRED when a pipeline stage
+#   cannot run without it, and OPTIONAL when its absence costs one feature
+#   and nothing else. The split exists because the flat list caused a
+#   three-day total outage on 2026-08-29:
+#     D68 appended gmail.modify for mark_read — a cosmetic nicety. Every
+#     existing token.json had been consented to only the first two scopes,
+#     and load_credentials passed this list into from_authorized_user_file,
+#     which made the hourly token REFRESH request a scope the refresh token
+#     never held. Google answered `invalid_scope: Bad Request`, so no
+#     credentials were produced at all. Ingest, drafting and sending — none
+#     of which need modify — were down until someone re-ran the consent flow.
+#   A convenience feature must never be able to take down the read path.
+#   Hence: missing REQUIRED → refuse to start. Missing OPTIONAL → warn and
+#   degrade the one call that needs it.
+REQUIRED_SCOPES: list[str] = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.compose",
+]
+
+OPTIONAL_SCOPES: list[str] = [
     # D68: needed by mark_read — removing the UNREAD label is a messages.modify
-    # call, which neither readonly nor compose grants. Kept alongside the other
-    # two rather than replacing readonly: the three are requested together and
-    # the D40 lesson was that swapping one for another breaks a capability
-    # nobody was watching.
-    # GOTCHA: adding this line invalidated every existing token.json. Google
-    # issues tokens against the scopes actually consented to, so an old file
-    # keeps failing with insufficientPermissions no matter what this list says.
-    # Delete token.json and re-run `python -m app.gmail.auth`.
+    # call, which neither readonly nor compose grants. Optional by D69: without
+    # it mark_read returns False and logs, and the only visible consequence is
+    # that replied-to mail stays bold in the inbox.
     "https://www.googleapis.com/auth/gmail.modify",
 ]
+
+# What the consent flow ASKS for. Always everything — there is no reason to
+# request less than the full set when a human is already looking at the screen.
+# GOTCHA: adding to this list does NOT invalidate an existing token.json any
+# more (that was the D68 failure). It does mean the extra scope stays missing
+# until the consent flow is re-run; check_scopes() below is what tells you.
+SCOPES: list[str] = REQUIRED_SCOPES + OPTIONAL_SCOPES
 
 # System label IDs Gmail hard-codes. Names == IDs for these; for user-created
 # labels we have to hit labels.list to resolve name → id.
@@ -227,7 +252,24 @@ def load_credentials(credentials_path: Path, token_path: Path) -> Credentials:
     # gets a RefreshError and needs to delete token.json and re-consent.
     creds: Credentials | None = None
     if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+        # CONCEPT: load with the scopes the token WAS GRANTED, not the scopes
+        #   this code wants. Passing scopes=None makes google-auth fall back to
+        #   the `scopes` key inside token.json (see from_authorized_user_info:
+        #   `if scopes is None and "scopes" in info`).
+        # WHY this matters more than it looks: the scopes on a Credentials
+        #   object are sent with the token-refresh request. Handing it a
+        #   LARGER set than was consented to makes Google reject the refresh
+        #   outright with `invalid_scope`, which yields no credentials — so a
+        #   missing cosmetic scope breaks reading, drafting and sending too.
+        #   Loading the granted set means the refresh always succeeds, and a
+        #   missing scope instead surfaces as a 403 on the ONE call that needs
+        #   it (mark_read already treats that as non-fatal).
+        # ALTERNATIVE: keep passing SCOPES and catch RefreshError to trigger
+        #   re-consent automatically. Rejected — the consent flow needs a
+        #   browser and a human, neither of which exists in the container at
+        #   3am. Degrading beats blocking on an interaction nobody is there
+        #   to perform.
+        creds = Credentials.from_authorized_user_file(str(token_path), None)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -251,6 +293,112 @@ def load_credentials(credentials_path: Path, token_path: Path) -> Credentials:
     return creds
 
 
+class MissingRequiredScopeError(RuntimeError):
+    """token.json lacks a scope the pipeline cannot function without.
+
+    WHY its own type rather than a bare RuntimeError: this is the one auth
+    failure a human must physically fix (re-run the consent flow in a
+    browser). Retrying it, dead-lettering it, or waiting for the next cycle
+    all accomplish nothing, so callers need to be able to tell it apart from
+    the transient failures that surround it.
+    GOTCHA: this lives in app.*, so retry_external's _is_domain_error check
+    passes it straight through instead of wrapping it in a
+    PermanentExternalError. That is deliberate — it must not become a
+    dead-letter row that looks like 57 other dead-letter rows.
+    """
+
+
+def check_scopes(creds: Credentials) -> tuple[list[str], list[str]]:
+    """Return (missing_required, missing_optional) for a loaded credential.
+
+    Reads what Google actually granted — `creds.scopes` comes from token.json,
+    not from this module's SCOPES list — so it answers "what can this token
+    really do", which is the only question worth asking at startup.
+    """
+    granted = set(creds.scopes or [])
+    missing_required = [s for s in REQUIRED_SCOPES if s not in granted]
+    missing_optional = [s for s in OPTIONAL_SCOPES if s not in granted]
+    return missing_required, missing_optional
+
+
+def _short(scope: str) -> str:
+    """`.../auth/gmail.modify` → `gmail.modify`, for log lines humans read."""
+    return scope.rsplit("/", 1)[-1]
+
+
+RECONSENT_HINT = (
+    "Delete token.json and re-run `python -m app.gmail.auth` "
+    "(needs a browser, so run it on the host, not in the container)."
+)
+
+
+def assert_required_scopes(creds: Credentials) -> list[str]:
+    """Raise if a required scope is missing; return the missing optional ones.
+
+    TRACE: called once per GmailClient.create(), i.e. once per ingest cycle,
+    BEFORE the first Gmail HTTP call. The failure therefore lands at the top
+    of the run with a message naming the fix, rather than as a 403 from
+    whichever node happened to touch Gmail first.
+    """
+    missing_required, missing_optional = check_scopes(creds)
+    if missing_required:
+        raise MissingRequiredScopeError(
+            f"token.json is missing required Gmail scope(s): "
+            f"{', '.join(_short(s) for s in missing_required)}. "
+            f"Ingest and drafting cannot run without them. {RECONSENT_HINT}"
+        )
+    return missing_optional
+
+
+def preflight_scopes(token_path: Path) -> bool:
+    """Report at startup what the persisted token can actually do.
+
+    Returns True when every required scope is present.
+
+    WHY this exists separately from assert_required_scopes: a long-running
+    supervisor should state its capabilities at boot, in one line an operator
+    can find, rather than letting the first cycle discover them 15 minutes
+    later inside a traceback. D69's outage was invisible for three days partly
+    because nothing ever announced what the token could do.
+
+    GOTCHA: this deliberately does NOT call load_credentials. That function
+    runs InstalledAppFlow.run_local_server() when no valid token exists, which
+    opens a browser and blocks until someone completes a consent screen — in a
+    container that is an indefinite hang at startup with no explanation. Here
+    we only read the file that already exists.
+    """
+    if not token_path.exists():
+        log.error("No token.json at %s — the agent cannot authenticate. %s",
+                  token_path, RECONSENT_HINT)
+        return False
+
+    creds = Credentials.from_authorized_user_file(str(token_path), None)
+    missing_required, missing_optional = check_scopes(creds)
+
+    if missing_required:
+        log.error(
+            "token.json is missing REQUIRED scope(s): %s. Ingest and drafting "
+            "will fail every cycle until this is fixed. %s",
+            ", ".join(_short(s) for s in missing_required), RECONSENT_HINT,
+        )
+        return False
+
+    if missing_optional:
+        # WHY warning and not error: this is the D68 situation, and the entire
+        # point of D69 is that it is survivable. Say exactly what degrades so
+        # nobody goes hunting for a failure that is working as designed.
+        log.warning(
+            "token.json is missing optional scope(s): %s. Everything runs; "
+            "mark_read will no-op, so replied-to mail stays unread in the "
+            "inbox. %s",
+            ", ".join(_short(s) for s in missing_optional), RECONSENT_HINT,
+        )
+    else:
+        log.info("Gmail scopes OK: %s",
+                 ", ".join(_short(s) for s in (creds.scopes or [])))
+    return True
+
+
 class GmailClient:
     """Thin wrapper around the Gmail v1 discovery client."""
 
@@ -261,6 +409,9 @@ class GmailClient:
     @classmethod
     def create(cls) -> GmailClient:
         creds = load_credentials(settings.gmail_credentials_path, settings.gmail_token_path)
+        # Fail fast and loudly on a missing REQUIRED scope; a missing optional
+        # one is the caller's problem to degrade around (mark_read does).
+        assert_required_scopes(creds)
         # WHY cache_discovery=False: the discovery cache lives in a tempdir and
         # emits a noisy warning on Python 3.10+ ("file_cache is only supported
         # with oauth2client<4.0.0"). Turning it off costs a network roundtrip

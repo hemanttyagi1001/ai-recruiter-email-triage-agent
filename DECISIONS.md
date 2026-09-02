@@ -1299,3 +1299,158 @@ and the HTML part is what most recipients see.
 **Revisit if:** the `fact_labels` sequence ever reaches `build_llm_reply` and
 `wrap_body` differently. They are two halves of one contract and the duplicate
 returns the moment they disagree.
+
+## D69 — Gmail scopes split into required and optional (2026-09-01)
+
+**Decision:** `SCOPES` becomes `REQUIRED_SCOPES` (`gmail.readonly`,
+`gmail.compose`) plus `OPTIONAL_SCOPES` (`gmail.modify`), and
+`load_credentials` loads token.json with the scopes it was GRANTED
+(`from_authorized_user_file(path, None)`) rather than the scopes this code
+wants. Missing required → `MissingRequiredScopeError` at client construction.
+Missing optional → a warning, and the one call that needs it degrades.
+
+**What went wrong:** adding `gmail.modify` for `mark_read` — a cosmetic
+feature — took the whole agent down for three days (2026-08-29 to 09-01).
+Passing the code's larger scope list into `from_authorized_user_file` put it on
+the hourly token REFRESH request; Google rejected the refresh with
+`invalid_scope: Bad Request`, so no credentials were produced at all. Ingest,
+drafting and sending do not need `modify` and were down anyway. The scope
+addition also never got a DECISIONS entry, so the "this invalidates every
+token.json" consequence was recorded only in a code comment.
+
+**Alternatives rejected:** (a) catch `RefreshError` and re-run consent
+automatically — the flow needs a browser and a human, neither of which exists
+in the container at 3am; (b) keep the flat list and rely on remembering to
+re-consent — that is what failed; (c) make `modify` required so the mismatch
+is loud — turns a cosmetic gap into a hard outage, which is the bug.
+
+**Revisit if:** a future scope becomes genuinely required by the read or send
+path. Then it moves lists, and the boot preflight starts refusing to run.
+
+## D70 — google-auth TransportError is retryable (2026-09-01)
+
+**Decision:** add `google.auth.exceptions.TransportError` to the retryable
+whitelist in `app/retry.py`.
+
+**Why:** it does not inherit from the builtin `ConnectionError` — the MRO is
+`TransportError → GoogleAuthError → Exception` — so it fell through every
+branch of `is_retryable()` into the permanent bucket and dead-lettered on
+attempt 1 with no retry at all. A DNS blip on 2026-09-01 dead-lettered 57
+consecutive recoverable messages in under a minute this way. The module's own
+docstring anticipated exactly this ("easier to notice we should retry this new
+error type"); it took an outage to notice.
+
+**Why it is safe:** `RefreshError` — the D69 bad-scope failure — is a SIBLING
+of `TransportError` under `GoogleAuthError`, not a subclass. Verified against
+the installed package. So genuine auth failures still fail once, not five times.
+
+**Revisit if:** another SDK's transport exception shows up in dead_letters with
+`attempts=1`. That signature — a network error that never retried — is the tell.
+
+## D71 — A run aborts after consecutive infra failures (2026-09-01)
+
+**Decision:** `app/cli/ingest.py` counts CONSECUTIVE `PermanentExternalError`s
+and raises `InfraOutageAborted` at 5, ending the run. Any completed message
+resets the count; content-quarantine failures neither increment nor reset it.
+
+**Why:** the per-message dead-letter guard is right when failures are
+independent and exactly wrong when they are shared. During a shared outage it
+converts a transient problem into permanent per-message damage at full speed,
+then reports the run as succeeded. Aborting leaves the remaining ids untouched
+— nothing was persisted for them — so the next cycle simply re-fetches them.
+
+**Alternatives rejected:** abort on the first infra failure — single transient
+failures are normal at this volume and runs would rarely finish.
+
+**Revisit if:** batches grow enough that 5 is noise, or if a partial-outage
+pattern (every other message failing) starts slipping past the consecutive rule.
+
+## D72 — Pinned DNS resolvers for the agent container (2026-09-01)
+
+**Decision:** `docker-compose.yml` sets `dns: [8.8.8.8, 1.1.1.1]` on the agent.
+
+**Why:** Docker's embedded resolver forwards to whatever the host's DNS was at
+container start. On Docker Desktop the host's resolver changes on sleep/wake,
+Wi-Fi switch and VPN toggle, and the container keeps forwarding to a server it
+can no longer reach — producing intermittent `NameResolutionError` on
+`oauth2.googleapis.com` and the Azure endpoint while the host resolves both
+fine. This is the root cause D70 and D71 make survivable.
+
+**Alternatives rejected:** rely on retries alone — the outage windows outlast
+the ~63s the backoff covers.
+
+**Revisit if:** the agent ever needs to resolve a private/internal hostname.
+Public resolvers cannot see split-horizon or corporate-internal DNS.
+
+## D73 — Reverted to draft-only autonomy (2026-09-01)
+
+**Decision:** `AUTO_SEND_MODE` moves from `on` to `draft`. Replies are created
+as Gmail drafts in the original thread; the operator reviews and presses send.
+No code change — this is the switch D45 armed, returned to the position D49
+describes.
+
+**Why:** the operator elected to put themselves back between the classifier and
+the recruiter. Under `on`, 17 replies went out in the 24h window ending
+2026-09-01T14:46Z (ctc_below_floor=1, outside_india_no_sponsorship=2, and 14
+with no rule verdict — i.e. not rule-fired declines but the D45 full-autonomy
+path, LLM-written bodies sent unread). Those are unrecoverable; email has no
+unsend. Draft mode keeps identical recipient resolution, body and signature and
+differs only in which Gmail API call fires, so nothing about reply quality
+changes — only who presses send.
+
+**Consequences worth knowing:** (a) the kill switch does NOT gate drafting
+(D49), so halting sends no longer stops anything in this mode — use
+`AUTO_SEND_MODE=off` to stop the agent producing replies at all; (b) `mark_read`
+runs only on the send path, so answered mail now stays UNREAD in the inbox,
+which makes unread a usable "I have not dealt with this yet" signal; (c) already
+-processed messages are not re-drafted — the idempotency guards skip them, so
+this affects newly arriving mail only.
+
+**Revisit if:** a soak period in `draft` shows the drafts are consistently
+sent unedited. That is the evidence D49 intended this mode to produce, and it
+is the only honest argument for arming `on` again.
+
+## D74 — One activity table, fed by the event trail we already had (2026-09-01)
+
+**Decision:** new `agent_activity` table (migration 0007) plus `app/activity.py`.
+One append-only row per notable thing the agent does, so "what is it doing" is
+a SELECT instead of a request to read container logs. snake_case columns, to
+match the other seven tables.
+
+**Why now:** three incidents on 2026-09-01 — a three-day auth outage, 57
+dead-lettered messages, and a silent backlog — were all present in `docker
+logs` and all went unnoticed. The existing tables are nouns (a message, a run,
+a failure) and answer "what is the state of X"; none answers "what happened, in
+order". The digest reads DB rows, so a failure occurring before any row is
+written showed up as zeros, which read as a quiet week.
+
+**The neat part:** almost no new instrumentation. Every node already emitted a
+`NodeEvent` into `TriageState["events"]` via an `operator.add` reducer, and that
+trail was serialised into the LangGraph checkpoint blob and never surfaced.
+`flush_events` is called once from `ingest._process_one` after `graph.invoke`
+returns, which captures every node's trace without any node knowing the table
+exists. Explicit `record()` calls cover what happens outside the graph: watch
+startup, scope preflight, run start/finish, dead letters, D71's infra abort.
+
+**Idempotency:** UNIQUE (message_id, node, at) + ON CONFLICT DO NOTHING, because
+a flush writes the whole accumulated list and the same early events reappear in
+later flushes. Chosen over tracking a high-water mark in state, which is one
+more thing to get wrong across a checkpoint restore.
+
+**Alternatives rejected:** (a) a logging.Handler mirroring Python logs into the
+table — captures unstructured strings and puts a DB write on every log line;
+(b) a view over the existing tables — cannot show what was never persisted;
+(c) keep reading `docker logs` — the status quo that lost three days.
+
+**Known gap:** a message resumed through the API after the approval interrupt
+runs a second `graph.invoke` whose events are not flushed. In draft mode almost
+nothing takes that path, so this landed without it. Wire the API resume path if
+approvals become common again.
+
+**Never breaks the pipeline:** every write is wrapped and swallowed, as in
+`app/dead_letter.py`. An agent that stops processing mail because it could not
+write a log line would be the worse failure.
+
+**Revisit if:** row volume outgrows a single table (only new messages generate
+rows, so this is a few hundred a day today), or if a retention policy becomes
+necessary. Nothing prunes this table today, deliberately.

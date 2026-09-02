@@ -23,7 +23,7 @@ import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from app import dead_letter
+from app import activity, dead_letter
 from app.candidate import load_profile
 from app.config import settings
 from app.db.engine import session_scope
@@ -37,6 +37,35 @@ from app.pipeline.graph import build_graph
 from app.retry import PermanentExternalError
 
 log = logging.getLogger(__name__)
+
+
+class InfraOutageAborted(RuntimeError):
+    """Raised when consecutive infra failures indicate the batch is doomed.
+
+    Not a per-message failure — a statement that the run should stop and let
+    the next cycle try again against (hopefully) working infrastructure.
+    """
+
+
+# CONCEPT: distinguishing "this message is bad" from "the world is down".
+#   The per-message dead-letter guard below is correct when failures are
+#   independent: one 5xx shouldn't cost the other 199 messages. It is exactly
+#   wrong when the failure is shared, because then it converts a transient
+#   outage into permanent per-message damage at full speed.
+#   On 2026-09-01 a DNS blip did precisely that: 57 consecutive messages
+#   dead-lettered inside gmail_get in under a minute, each one individually
+#   "handled". The run reported success. Nothing was retried, and the
+#   dead_letters table filled with 57 rows describing one event.
+#   So: count CONSECUTIVE infra failures, and if they pile up, abort the run.
+#   The messages are untouched, the next cycle re-fetches them, and the
+#   evidence is one aborted run instead of a wall of rows.
+# WHY 5: comfortably above the "two flaky messages in a row" noise floor and
+#   far below the batch size, so a genuine outage is caught in seconds while
+#   an unlucky pair costs nothing.
+# ALTERNATIVE: abort on the FIRST infra failure. Rejected — single transient
+#   failures against Gmail and Azure are normal at this volume, and aborting
+#   every run on one of them would mean rarely finishing a batch.
+CONSECUTIVE_INFRA_FAILURE_LIMIT = 5
 
 
 def main() -> None:
@@ -58,10 +87,23 @@ def main() -> None:
     counters["fetched"] = len(ids)
     log.info("Fetched %d message ids from label=%s", len(ids), settings.gmail_label)
 
+    activity.record(
+        node="ingest", event="run_started", run_id=run_id,
+        outcome=f"fetched {len(ids)} ids from label={settings.gmail_label}",
+        detail={"auto_send_mode": settings.auto_send_mode,
+                "label": settings.gmail_label, "fetched": len(ids)},
+    )
+
     # The checkpointer opens a psycopg connection; keep it open for the
     # whole run so every graph.invoke() shares one connection pool slot.
     with open_checkpointer() as checkpointer:
         graph = build_graph(llm, profile, gmail, checkpointer)
+
+        # Reset by any message that completes; only an unbroken streak counts.
+        # WHY the content-quarantine branch neither increments nor resets it:
+        # a malformed email says nothing about whether the network is up, so
+        # it should neither trigger an outage abort nor mask one in progress.
+        consecutive_infra_failures = 0
 
         try:
             for i, gmail_id in enumerate(ids, start=1):
@@ -76,7 +118,9 @@ def main() -> None:
                 #   persisting extraction_failed.
                 try:
                     _process_one(gmail_id, gmail, graph, run_id, counters)
+                    consecutive_infra_failures = 0
                 except PermanentExternalError as pex:
+                    consecutive_infra_failures += 1
                     counters["dead_lettered"] += 1
                     # GOTCHA: at this point we may or may not have a
                     # parsed Message-ID — the failure could have happened
@@ -93,6 +137,38 @@ def main() -> None:
                         "gmail_id=%s dead-lettered after %d attempts: %s",
                         gmail_id, pex.attempts, pex.original,
                     )
+                    activity.record(
+                        node=_node_from_pex(pex), event="dead_lettered",
+                        level="error", run_id=run_id,
+                        outcome=f"{type(pex.original).__name__}: {pex.original}"[:500],
+                        detail={"gmail_id": gmail_id, "attempts": pex.attempts,
+                                "error_class": type(pex.original).__name__},
+                    )
+                    if consecutive_infra_failures >= CONSECUTIVE_INFRA_FAILURE_LIMIT:
+                        activity.record(
+                            node="ingest", event="infra_outage_aborted",
+                            level="error", run_id=run_id,
+                            outcome=(
+                                f"{consecutive_infra_failures} consecutive infra "
+                                f"failures; {len(ids) - i} of {len(ids)} messages "
+                                f"left for the next cycle"
+                            ),
+                            detail={"consecutive_failures": consecutive_infra_failures,
+                                    "remaining": len(ids) - i,
+                                    "error_class": type(pex.original).__name__},
+                        )
+                        # TRACE: this propagates to the outer handler below,
+                        # which marks the run FAILED and re-raises; watch.py
+                        # logs it and sleeps until the next cycle. The
+                        # remaining ids are simply not visited — they were
+                        # never persisted, so the next run re-fetches them.
+                        raise InfraOutageAborted(
+                            f"aborting run after {consecutive_infra_failures} "
+                            f"consecutive infra failures (last: "
+                            f"{type(pex.original).__name__}: {pex.original}); "
+                            f"{len(ids) - i} of {len(ids)} messages left "
+                            f"untouched for the next cycle"
+                        ) from pex
                 except Exception as exc:
                     # CONCEPT: quarantine the message, not the run.
                     #   The clause above was the whole guard, and it only
@@ -121,6 +197,13 @@ def main() -> None:
                         "gmail_id=%s failed with unhandled %s; dead-lettering "
                         "and continuing with the rest of the run",
                         gmail_id, type(exc).__name__,
+                    )
+                    activity.record(
+                        node="ingest", event="quarantined_content",
+                        level="error", run_id=run_id,
+                        outcome=f"unhandled {type(exc).__name__}: {exc}"[:500],
+                        detail={"gmail_id": gmail_id,
+                                "error_class": type(exc).__name__},
                     )
                     dead_letter.record(
                         node="ingest",
@@ -195,6 +278,32 @@ def _process_one(gmail_id, gmail, graph, run_id, counters) -> None:
     _tally_usage(counters, final_state)
 
     status = final_state.get("final_status")
+
+    # D74: flush this message's whole node trace into agent_activity, then one
+    # summary row carrying the verdict.
+    # TRACE: final_state["events"] holds one NodeEvent per node that ran, in
+    # order, because state.py merges them with operator.add. This single call
+    # is why no pipeline node needs to know the activity table exists.
+    activity.flush_events(
+        final_state.get("events", []),
+        message_id=parsed.message_id,
+        run_id=run_id,
+    )
+    # WHY node="pipeline" rather than a real node name: this row is about the
+    # message's outcome as a whole, not about any one node's execution. Using
+    # a name no node uses keeps `WHERE node = 'auto_send'` meaning strictly
+    # "the auto_send node ran".
+    activity.record(
+        node="pipeline",
+        event=str(status) if status else "unknown",
+        message_id=parsed.message_id,
+        run_id=run_id,
+        outcome=f"{parsed.from_email} | {(parsed.subject or '')[:120]}",
+        detail={
+            "gmail_id": gmail_id,
+            "gmail_draft_id": final_state.get("gmail_draft_id"),
+        },
+    )
     if status == MessageStatus.AWAITING_APPROVAL:
         counters["awaiting_approval"] += 1
     elif status == MessageStatus.AUTO_SENT:
@@ -253,6 +362,35 @@ def _node_from_pex(pex: PermanentExternalError) -> str:
 
 
 def _finalise_run(run_id, status: str, counters: dict) -> None:
+    # WHY the activity row comes first: this function runs in a `finally`, so
+    # it executes on the failure path too. If the counter UPDATE below is what
+    # blows up, the log still records that the run ended and how.
+    activity.record(
+        node="ingest",
+        event="run_finished",
+        level="info" if status == RunStatus.SUCCEEDED else "error",
+        run_id=run_id,
+        outcome=(
+            f"{status}: fetched={counters['fetched']} new={counters['new']} "
+            f"awaiting={counters['awaiting_approval']} "
+            f"terminal={counters['terminal']} "
+            f"auto_sent={counters['auto_sent']} "
+            f"dead={counters['dead_lettered']} "
+            f"cost=${counters['cost']:.4f}"
+        ),
+        detail={
+            "status": str(status),
+            "fetched": counters["fetched"],
+            "new": counters["new"],
+            "awaiting_approval": counters["awaiting_approval"],
+            "terminal": counters["terminal"],
+            "auto_sent": counters["auto_sent"],
+            "dead_lettered": counters["dead_lettered"],
+            # WHY str(): Decimal is not JSON-serialisable, and rounding it to a
+            # float here would quietly disagree with runs.estimated_cost_usd.
+            "cost_usd": str(counters["cost"]),
+        },
+    )
     with session_scope() as s:
         run = s.get(Run, run_id)
         run.finished_at = datetime.now(timezone.utc)
