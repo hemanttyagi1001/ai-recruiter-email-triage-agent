@@ -39,8 +39,10 @@ import sys
 import time
 from types import FrameType
 
+from app import activity
 from app.cli.ingest import main as ingest_once
 from app.config import settings
+from app.gmail.client import preflight_scopes
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +134,42 @@ def main() -> int:
         interval_minutes, settings.auto_send_mode,
         settings.gmail_label, settings.gmail_max_messages,
     )
+
+    # D69: state the mailbox capability at boot rather than discovering it in
+    # a traceback one interval later.
+    # WHY we keep looping even when this returns False: the token file is a
+    # bind mount. An operator fixing it on the host takes effect on the next
+    # cycle with no restart, so exiting here would turn a self-healing
+    # situation into one that needs a deploy. The error line is the signal.
+    scopes_ok = preflight_scopes(settings.gmail_token_path)
+
+    # WHY these two rows: they are the answer to "when did it last restart, and
+    # in what mode" — the first question worth asking about a process that has
+    # been running unattended for weeks, and one no other table records.
+    activity.record(
+        node="watch",
+        event="watch_started",
+        outcome=(
+            f"interval={interval_minutes}m mode={settings.auto_send_mode} "
+            f"label={settings.gmail_label}"
+        ),
+        detail={
+            "interval_minutes": interval_minutes,
+            "auto_send_mode": settings.auto_send_mode,
+            "label": settings.gmail_label,
+            "max_messages": settings.gmail_max_messages,
+        },
+    )
+    activity.record(
+        node="gmail",
+        event="scopes_ok" if scopes_ok else "scopes_missing",
+        level="info" if scopes_ok else "error",
+        outcome=(
+            "all required Gmail scopes present" if scopes_ok
+            else "a REQUIRED Gmail scope is missing; every cycle will fail "
+                 "until token.json is re-consented"
+        ),
+    )
     if settings.auto_send_mode == "on":
         # WHY this is a warning and not an info: it is the single most
         # consequential thing about this process. Someone reading logs after a
@@ -161,6 +199,19 @@ def main() -> int:
             # traceback per cycle rather than a hot loop, and the log line is
             # the signal to go look.
             log.exception("cycle %d failed; continuing to next cycle", cycle)
+            # GOTCHA: this is the row that would have made D69's three-day
+            # outage visible on day one. ingest's own run_finished row is
+            # written in a finally block and so covers most failures, but a
+            # crash BEFORE the run row exists — GmailClient.create() raising,
+            # exactly what happened — produces nothing at all without this.
+            exc = sys.exc_info()[1]
+            activity.record(
+                node="watch",
+                event="cycle_failed",
+                level="error",
+                outcome=f"cycle {cycle}: {type(exc).__name__}: {exc}"[:500],
+                detail={"cycle": cycle, "error_class": type(exc).__name__},
+            )
 
         elapsed = time.monotonic() - started
         log.info("cycle %d finished in %.1fs", cycle, elapsed)

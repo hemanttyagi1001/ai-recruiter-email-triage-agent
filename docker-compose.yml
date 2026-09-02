@@ -44,6 +44,24 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+    # D69: pin public resolvers instead of inheriting Docker's embedded one.
+    # WHY: Docker's built-in resolver at 127.0.0.11 forwards to whatever the
+    # HOST's DNS was when the container started. On Docker Desktop the host
+    # changes resolver constantly — laptop sleep/wake, Wi-Fi switch, VPN up or
+    # down — and the container keeps forwarding to a server it can no longer
+    # reach. The symptom is not a clean outage but intermittent
+    # NameResolutionError on oauth2.googleapis.com and the Azure endpoint,
+    # while the host itself resolves both fine.
+    # GOTCHA: this is what dead-lettered 57 messages on 2026-09-01. The retry
+    # classifier fix (D69, app/retry.py) makes those failures survivable; this
+    # line is what stops most of them happening. Both are needed — retrying a
+    # resolver that will never answer just fails five times instead of once.
+    # ALTERNATIVE: leave DNS alone and rely on retries. Rejected: the outage
+    # windows outlast the ~63s the backoff covers.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+
     volumes:
       # GOTCHA: token.json is mounted READ-WRITE on purpose. Access tokens
       # expire hourly and load_credentials() rewrites this file on every

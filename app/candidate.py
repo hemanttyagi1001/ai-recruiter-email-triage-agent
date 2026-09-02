@@ -85,11 +85,28 @@ class _Candidate(BaseModel):
     # is null, not an invention.
     native_location: str | None = None
     reason_for_job_change: str | None = None
+    # D68: the last three labels the observed forms ask for that nothing else
+    # in the system could answer. Before these existed the LLM drafter filled
+    # them in from the recruiter's own labels — "Available for interview: Yes",
+    # "Current company/payroll: I will provide on a call" — which is a model
+    # composing a commitment on the candidate's behalf to someone who will hold
+    # them to it. Moving them into config makes the answer the candidate's
+    # words, quoted, not the model's paraphrase.
+    # WHY str and not bool for the two yes/no ones: the honest answer is often
+    # not "Yes". "Yes, weekday evenings" and "Remote or Delhi NCR only" are the
+    # real replies, and a bool would force them into a lie by rounding.
+    # GOTCHA: still Optional, and an unset value is dropped from the block
+    # rather than rendered — the standing rule that a field the source does not
+    # state is null, not a guess.
+    current_company: str | None = None
+    interview_availability: str | None = None
+    remote_preference: str | None = None
 
     @field_validator(
         "stack", "notice_period", "current_location",
         "preferred_location", "employment_status",
         "native_location", "reason_for_job_change",
+        "current_company", "interview_availability", "remote_preference",
         mode="before",
     )
     @classmethod

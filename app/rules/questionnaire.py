@@ -57,6 +57,24 @@ _FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
     ("Current CTC", r"current\s+ctc"),
     ("Expected CTC", r"expected\s+ctc"),
     ("Last Working Day", r"last\s+working\s+day"),
+    # D68: three labels the forms ask for that had no profile field behind
+    # them until now. They are listed last only because they were added last —
+    # `detect_fields` sorts by position in the recruiter's message, so the
+    # order here never reaches the reply.
+    # GOTCHA: "current company" must not be allowed to match "current
+    # location", and it cannot, because the alternation demands one of the
+    # company words. The reverse direction is what needs care: Indian staffing
+    # forms write "Current company/payroll" and "Payroll company" for the same
+    # question — whose employer of record is this — so both spellings map to
+    # one canonical label rather than answering twice.
+    (
+        "Current Company",
+        r"current\s+(?:company|employer|organisation|organization)"
+        r"(?:\s*/\s*payroll)?"
+        r"|payroll\s+(?:company|name)",
+    ),
+    ("Available for Interview", r"available\s+for\s+(?:an?\s+|the\s+)?interview"),
+    ("Interested in Remote", r"(?:interested\s+in|open\s+to)\s+remote"),
 )
 
 # GOTCHA: the label and its colon are frequently separated by a parenthetical
@@ -73,14 +91,28 @@ _FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
 # twice.
 _COLON = r"(?:\s*\([^)]*\))?\s*:"
 
+# GOTCHA: the label pattern is wrapped in its own group before the colon is
+# appended. `|` binds looser than concatenation, so `re.compile("a|b" + ":")`
+# means "a" OR "b:" — the first alternative silently loses the colon
+# requirement, which is the single character doing most of the discrimination
+# in this module. Every pattern above happens to group its own alternation, so
+# the un-wrapped version worked; wrapping here means the next one added does
+# not have to remember.
 _COMPILED: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
-    (label, re.compile(pattern + _COLON, re.IGNORECASE))
+    (label, re.compile(f"(?:{pattern}){_COLON}", re.IGNORECASE))
     for label, pattern in _FIELD_PATTERNS
 )
 
 # Below this many distinct fields, treat the message as ordinary follow-up
 # conversation and leave it to a human. See the module GOTCHA.
 MIN_FIELDS = 3
+
+# The canonical label vocabulary, exported so the draft generator can key its
+# answer table off exactly these strings instead of retyping them. A label that
+# exists here with no answer behind it renders nothing, and an answer keyed to
+# a label that is not here can never be asked for — both are silent failures,
+# so the two lists are checked against each other at import in generator.py.
+FIELD_LABELS: tuple[str, ...] = tuple(label for label, _ in _FIELD_PATTERNS)
 
 
 def detect_fields(body_text: str | None) -> list[str]:

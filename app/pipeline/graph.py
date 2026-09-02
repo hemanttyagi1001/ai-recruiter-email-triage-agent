@@ -82,6 +82,7 @@ from app.config import settings
 from app.db.models import EXTRACTABLE_CATEGORIES, Category, DraftType
 from app.dedup.nodes import make_dedup_check_node, make_embed_jd_node
 from app.drafts.generator import (
+    DEFAULT_FACT_LABELS,
     build_decline,
     build_interested,
     build_pivot,
@@ -326,13 +327,30 @@ def _make_draft_node(profile: CandidateProfile, llm: LLMClient):
         #   the recruiter is waiting either way.
         if settings.draft_mode == "llm" and draft_type == DraftType.INTERESTED:
             try:
+                # CONCEPT: a role pitch can also BE a screening form (D68).
+                #   The questionnaire path handles a form that arrives as a
+                #   bare follow-up, but recruiters routinely pitch a role and
+                #   append the form to the same mail. That lands here, on the
+                #   INTERESTED path, and it used to produce the standing facts
+                #   twice — once as the model's prose answering the form, once
+                #   as the fixed block code appends underneath.
+                # TRACE: detect_fields returns their labels ordered by where
+                #   each appeared in their message. The SAME list goes to both
+                #   calls below: to the drafter as "these are already
+                #   answered, do not write them", and to wrap_body as "render
+                #   exactly these, in this order". An empty list means they
+                #   asked for nothing in particular and wrap_body falls back
+                #   to DEFAULT_FACT_LABELS.
+                fact_labels = detect_fields(parsed.body_text)
                 raw, draft_usage = build_llm_reply(
-                    parsed, opp, profile, llm, resume_attached=resume_attached
+                    parsed, opp, profile, llm,
+                    resume_attached=resume_attached,
+                    fact_labels=fact_labels or DEFAULT_FACT_LABELS,
                 )
                 # The model writes only the middle. Greeting and signature come
                 # from the same code the templates use, so a reply reads
                 # identically whichever drafter produced it.
-                body = wrap_body(raw, parsed, opp, profile)
+                body = wrap_body(raw, parsed, opp, profile, fact_labels or None)
                 source = "llm"
             except Exception:
                 log.exception(

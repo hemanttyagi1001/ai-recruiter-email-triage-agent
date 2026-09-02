@@ -162,6 +162,25 @@ def _transport_retryable_types() -> tuple[type[BaseException], ...]:
                       httpx.RemoteProtocolError])
     except ImportError:
         pass
+    try:
+        # D69: google-auth raises its OWN transport exception, and it does
+        # not inherit from the builtin ConnectionError — the MRO is
+        # TransportError → GoogleAuthError → Exception. So a DNS failure
+        # while refreshing the Gmail token fell straight through to the
+        # permanent bucket and dead-lettered on attempt 1, with no retry.
+        # GOTCHA: this was not theoretical. On 2026-09-01 a DNS blip inside
+        # the container ("Unable to find the server at oauth2.googleapis.com")
+        # dead-lettered 57 consecutive messages in a single run — every one
+        # of them recoverable, none of them retried.
+        # WHY this is safe to add: RefreshError — the "your token's scopes
+        # are wrong" failure — is a SIBLING of TransportError under
+        # GoogleAuthError, not a subclass. Adding TransportError therefore
+        # does not start retrying genuine auth failures, which would burn
+        # five attempts to fail identically five times.
+        from google.auth.exceptions import TransportError
+        types.append(TransportError)
+    except ImportError:
+        pass
     return tuple(types)
 
 

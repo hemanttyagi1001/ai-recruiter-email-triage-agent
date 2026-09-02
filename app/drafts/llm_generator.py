@@ -53,6 +53,7 @@ claiming the prompt is airtight.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 from pydantic import BaseModel, Field
 
@@ -131,15 +132,21 @@ FORMAT — this matters as much as the content:
 - Short paragraphs separated by a blank line. Never one dense block; the
   first LLM-written draft came back as a single 120-word paragraph and read
   worse than the template it replaced.
-- DO NOT list the candidate's standing facts. The bullet list of total
-  experience, relevant experience, CTC, notice period and location is
-  appended automatically after your text, formatted exactly as it must
-  appear. Restating any of those values produces a visible duplicate.
+- DO NOT list the candidate's standing facts. An answer block is appended
+  automatically after your text, formatted exactly as it must appear. The
+  user message names the exact fields it will contain. Restating any of
+  those values — in a list, in a table, or as a run of "Label: value"
+  sentences in a paragraph — produces a visible duplicate.
+- This holds EVEN IF the recruiter's email is a form asking for those exact
+  fields. The block is what answers a form; it is built from the labels they
+  used, in the order they used them. Answering the form yourself as well is
+  the single most likely way to produce a duplicated reply.
 - The facts above are still yours to USE: if the recruiter asked a question
-  one of them answers, answer it in a sentence. What you must not do is
-  reproduce the list.
-- Write prose only: the reply to what they actually asked, and nothing else.
-  Do not write a closing summary of your details — the block covers it.
+  one of them answers in prose — "are you open to relocating?" — answer it
+  in a sentence. What you must not do is reproduce the list.
+- Write prose only: the reply to what they actually asked that the block does
+  NOT cover, and nothing else. If the block covers everything they asked,
+  write one or two sentences of genuine response and stop.
 
 TONE: warm, direct, professional. Write like a senior engineer replying \
 between meetings — not like a cover letter.
@@ -156,6 +163,7 @@ def _user_prompt(
     parsed: ParsedMessage,
     opp: Opportunity | None,
     resume_attached: bool,
+    fact_labels: Sequence[str],
 ) -> str:
     role = (opp.role_title if opp else None) or "unspecified"
     company = (opp.company if opp else None) or "unspecified"
@@ -175,6 +183,13 @@ def _user_prompt(
         "share it, but do not claim anything is attached."
     )
 
+    # D68: naming the fields explicitly, rather than describing them, is what
+    # makes the FORMAT rule checkable by the model. "Do not restate the
+    # standing facts" is a judgement call it got wrong on a form email;
+    # "these seven labels are already answered below your text" is a list it
+    # can compare against.
+    covered = "\n".join(f"- {label}" for label in fact_labels) or "- (none)"
+
     return f"""What the extractor pulled from this email:
 - Role: {role}
 - Company: {company}
@@ -182,9 +197,18 @@ def _user_prompt(
 
 {attachment_note}
 
-Write the candidate's reply. Answer any direct questions the recruiter asked, \
-using only the candidate facts from the system prompt. Where a question cannot \
-be answered from those facts, say so briefly rather than guessing.
+AN ANSWER BLOCK IS APPENDED BELOW YOUR TEXT. It already answers these fields, \
+in this order, in the candidate's exact figures:
+{covered}
+
+Do not write any of those values into your text. They are handled. If the \
+recruiter's email asked for them, it has been answered — say nothing further \
+about it.
+
+Write the candidate's reply. Answer any direct questions the recruiter asked \
+that the block above does NOT cover, using only the candidate facts from the \
+system prompt. Where a question cannot be answered from those facts, say so \
+briefly rather than guessing.
 
 Ask them nothing in return. If budget, work model, employment type or \
 timeline are missing from their email, say nothing about it — state the \
@@ -203,6 +227,7 @@ def build_llm_reply(
     profile: CandidateProfile,
     llm: LLMClient,
     resume_attached: bool = False,
+    fact_labels: Sequence[str] = (),
 ) -> tuple[str, Usage]:
     """Generate a reply body. Raises on failure — the caller falls back.
 
@@ -211,12 +236,22 @@ def build_llm_reply(
     (`graph._make_draft_node`) catches everything and falls back to the
     template, because a failed LLM call must degrade to a worse reply, never
     to no reply.
+
+    GOTCHA: `fact_labels` must be the SAME sequence the caller then hands to
+    `wrap_body`. They are two halves of one contract — this tells the model
+    what not to write, that decides what actually gets appended — and passing
+    different lists to each is how the duplicate D68 fixed would come back.
     """
     result, usage = llm.structured_completion(
         schema=ReplyDraft,
         messages=[
             {"role": "system", "content": _system_prompt(profile)},
-            {"role": "user", "content": _user_prompt(parsed, opp, resume_attached)},
+            {
+                "role": "user",
+                "content": _user_prompt(
+                    parsed, opp, resume_attached, fact_labels
+                ),
+            },
         ],
     )
     body = result.body_text.strip()

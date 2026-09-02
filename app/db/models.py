@@ -23,10 +23,12 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -497,3 +499,88 @@ class SystemFlag(Base):
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
     updated_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class AgentActivity(Base):
+    """The one table to read when asking "what is the agent doing?".
+
+    CONCEPT: why this table exists when six others already hold state.
+      The existing tables are all NOUNS — a message, a draft, a run, a
+      failure. Each answers "what is the current state of X". None answers
+      "what happened, in order, and when", which is the question you
+      actually ask when something looks wrong. Reconstructing a narrative
+      meant joining four tables and then reading container logs for the
+      parts that were never persisted at all.
+
+    CONCEPT: the data was already being collected and thrown away.
+      Every pipeline node already emits a NodeEvent (node, at, duration_ms,
+      outcome) into TriageState["events"], merged with an operator.add
+      reducer. That trail was serialised into LangGraph's checkpoint blob
+      and never surfaced — queryable only by deserialising checkpoints.
+      This table is where it gets flushed. See app/activity.py.
+
+    WHY append-only with no status column: a log you can UPDATE is a log you
+    can no longer trust as a record of what happened. Corrections go in as
+    new rows.
+
+    GOTCHA: `message_id` is deliberately NOT a foreign key, unlike the one on
+    dead_letters. Activity rows are written from their own transaction and
+    can describe a message before its row is committed (or one that was
+    later deleted). An audit log that can fail on a referential race is an
+    audit log that goes missing exactly when the system is misbehaving.
+    """
+
+    __tablename__ = "agent_activity"
+
+    # BigInteger + autoincrement → BIGSERIAL. WHY not a UUID like the other
+    # tables: this table is read in time order by a human far more often than
+    # it is joined, and a monotonic id makes "everything after row N" a
+    # trivial cursor. Nothing external references these ids.
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )
+
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True
+    )
+    # Null for supervisor-level rows (cycle start/finish, scope preflight)
+    # which are about the process, not about any one message.
+    message_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # info / warning / error. WHY a string and not the stdlib's int levels:
+    # `WHERE level = 'error'` is what you will type at 2am.
+    level: Mapped[str] = mapped_column(String(8), default="info")
+
+    # Which part of the system spoke: a graph node (classify, auto_send) or a
+    # process-level component (watch, ingest, gmail).
+    node: Mapped[str] = mapped_column(String(32), index=True)
+
+    # A short machine-readable code — cycle_started, draft_created,
+    # quarantined, dead_lettered, infra_outage_aborted, scope_missing.
+    # WHY separate from `outcome`: codes are for filtering and counting,
+    # prose is for reading. Mixing them means grepping a text column forever.
+    event: Mapped[str] = mapped_column(String(48), index=True)
+
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Structured extras — rule name, fit score, error class, gmail ids.
+    detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    __table_args__ = (
+        # CONCEPT: this constraint is what makes flushing safe to repeat.
+        #   The events list accumulates across a message's whole graph run,
+        #   so persist_pending and a later persist_final both see the early
+        #   events. Rather than track what has been flushed, every write is
+        #   ON CONFLICT DO NOTHING against this key — replaying a flush is
+        #   free, and no event can be recorded twice.
+        # GOTCHA: in Postgres NULLs compare as distinct in a UNIQUE
+        #   constraint, so supervisor rows (message_id IS NULL) never collide
+        #   with each other. That is correct here — they are written once by
+        #   an explicit call, not replayed from an accumulating list.
+        UniqueConstraint("message_id", "node", "at", name="uq_agent_activity_event"),
+        # The query you will actually run: newest first, usually filtered.
+        Index("ix_agent_activity_at_desc", at.desc()),
+    )
