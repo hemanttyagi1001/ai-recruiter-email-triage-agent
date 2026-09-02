@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from langgraph.types import Command
@@ -40,6 +41,12 @@ from app.api.schemas import (
 )
 from app.db.engine import session_scope
 from app.db.models import Draft, DraftStatus, Message, MessageStatus, Opportunity
+from app.observability.tracing import (
+    trace_callbacks,
+    trace_metadata,
+    trace_run_name,
+    trace_tags,
+)
 
 log = logging.getLogger(__name__)
 
@@ -153,14 +160,15 @@ def approve(
     Per Phase 2 Q5: trust the human. If they edit the body, we do NOT re-run
     the outbound validator. The human is signing off on the exact bytes."""
     with session_scope() as s:
-        _get_awaiting_message(s, thread_id)  # 404/409 guard
+        msg = _get_awaiting_message(s, thread_id)  # 404/409 guard
+        ident = _trace_identity(msg)
 
     # CONCEPT: Command(update=...) is LangGraph's way to inject state
     # into a paused thread and resume. The reducers apply as if a node
     # had returned this dict. `approval_status`, `approval_reason`,
     # `approved_body` all use REPLACE (default), so they just set the
     # value.
-    config = {"configurable": {"thread_id": thread_id}}
+    config = _resume_trace_config(thread_id, ident, "approved")
     updates = {"approval_status": "approved", "approval_reason": body.note}
     if body.edited_body is not None:
         updates["approved_body"] = body.edited_body
@@ -186,9 +194,10 @@ def reject(
     """Reject the draft. Act node runs but skips Gmail; persist_final
     records rejected."""
     with session_scope() as s:
-        _get_awaiting_message(s, thread_id)
+        msg = _get_awaiting_message(s, thread_id)
+        ident = _trace_identity(msg)
 
-    config = {"configurable": {"thread_id": thread_id}}
+    config = _resume_trace_config(thread_id, ident, "rejected")
     final_state = graph.invoke(
         Command(update={"approval_status": "rejected", "approval_reason": body.reason}),
         config=config,
@@ -203,6 +212,58 @@ def reject(
 # =============================================================================
 # helpers
 # =============================================================================
+
+
+def _trace_identity(msg: Message) -> SimpleNamespace:
+    """Snapshot the five fields the tracing helpers read off a message.
+
+    CONCEPT: why a snapshot rather than passing the ORM row. `session_scope`
+    closes its session on exit, and a SQLAlchemy instance read after that
+    raises DetachedInstanceError on first attribute access — a failure that
+    would surface inside the tracer, on the approve path, in production only.
+    Copying the scalars out while the session is open makes the object inert.
+
+    WHY SimpleNamespace and not a dict: `trace_run_name`/`trace_metadata` take
+    a ParsedMessage in the ingest path and read attributes. Handing them an
+    object with the same five attribute names means one implementation serves
+    both call sites instead of two that can drift apart.
+    """
+    return SimpleNamespace(
+        message_id=msg.message_id,
+        gmail_id=msg.gmail_id,
+        subject=msg.subject,
+        from_email=msg.from_email,
+        from_name=msg.from_name,
+    )
+
+
+def _resume_trace_config(thread_id: str, ident: SimpleNamespace, action: str) -> dict:
+    """Invoke config for a resume, traced the same way ingest traces a message.
+
+    TRACE: before D75 these two endpoints passed `configurable` alone, so the
+    half of the graph that runs AFTER a human decides — act, persist_final,
+    the Gmail send itself — produced no LangSmith run at all. The interesting
+    failures live in that half. `resume_action` is stamped as metadata so an
+    approve and a reject are one filter apart in the UI.
+    """
+    name = trace_run_name(ident)
+    meta = trace_metadata(ident)
+    tags = trace_tags()
+    # GOTCHA: LangGraph copies invoke-config `metadata` into the CHECKPOINT
+    # metadata it writes to Postgres, not just into the trace. Populating
+    # these only when tracing is armed keeps the checkpoints table identical
+    # to what it was for anyone running untraced — an observability feature
+    # should not quietly change the durable state it observes.
+    if meta:
+        meta["resume_action"] = action
+        tags = [*tags, f"resume:{action}"]
+    return {
+        "configurable": {"thread_id": thread_id},
+        "callbacks": trace_callbacks(),
+        "run_name": f"{action} — {name}" if name else None,
+        "metadata": meta,
+        "tags": tags,
+    }
 
 
 def _get_awaiting_message(session, thread_id: str) -> Message:

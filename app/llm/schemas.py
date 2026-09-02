@@ -46,6 +46,25 @@ class ClassificationResult(BaseModel):
     # to notice and discard.
     model_config = ConfigDict(extra="forbid")
 
+    # CONCEPT: field ORDER is load-bearing under grammar-constrained decoding.
+    #   Strict structured output makes the model emit properties in the order
+    #   this class declares them, token by token. Declaring `reason` FIRST
+    #   means the justification is generated BEFORE the category it justifies,
+    #   so the category is conditioned on the reasoning rather than the
+    #   reasoning being a post-hoc rationalisation of a label already chosen.
+    #   This is chain-of-thought bought for the price of a field.
+    # ALTERNATIVE: put `reason` last, which reads more naturally as a schema.
+    #   Rejected precisely because it inverts the causality above — the model
+    #   would commit to `category` first and then write prose defending it,
+    #   which is worth strictly less as a debugging signal because it cannot
+    #   disagree with the answer.
+    # WHY 200 chars: this is read in a trace list and in an activity row, not
+    #   studied. A cap the model must respect keeps it a sentence.
+    # GOTCHA: this field costs output tokens on EVERY classify call, which is
+    #   the highest-volume LLM call in the pipeline (one per message, before
+    #   any gate). ~50 tokens at the cap. That was accepted knowingly — see
+    #   D76 — because a miscategorised email was previously undiagnosable.
+    reason: str = Field(max_length=200)
     category: CategoryValue
     confidence: float = Field(ge=0.0, le=1.0)
 

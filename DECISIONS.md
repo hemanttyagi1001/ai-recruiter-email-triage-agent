@@ -1454,3 +1454,105 @@ write a log line would be the worse failure.
 **Revisit if:** row volume outgrows a single table (only new messages generate
 rows, so this is a few hundred a day today), or if a retention policy becomes
 necessary. Nothing prunes this table today, deliberately.
+
+## D75 — Subject and sender are releasable to LangSmith, behind one flag (2026-09-02)
+
+**Decision:** new `LANGSMITH_TRACE_IDENTIFIERS`, default false. When true, a
+second replacer in `app/observability/redaction.py` passes exactly three fields
+through unmasked — `subject`, `from_name`, `from_email` — and `tracing.py`
+stamps them into a run name and run metadata so a message is findable in the
+LangSmith list view. Everything else is unchanged in both modes.
+
+**Why:** strict redaction (D63) is correct and made tracing useless for the job
+it was turned on for. Every run carried LangGraph's default name and
+`[REDACTED:free-text]` where the subject was, so "is THIS email in the right
+category" was unanswerable — you could not tell the rows apart to find the one
+you meant. Observability you cannot navigate is not observability.
+
+**Why a flag and not an edit:** D63's own module comment prescribed this shape
+in advance — "a second replacer selected by an explicit setting, NOT a
+loosening of this one". The hard rule ("prose is not sanitisable, so prose does
+not travel") is untouched and untouchable by config; the flag picks between two
+audited replacers that both enforce it. `body_text`, `jd_text`, `draft_body`,
+`raw_headers` and LLM `content` are dropped whole in both modes, and extracted
+values (`recruiter_name`, `company`, `end_client`) are NOT released — you audit
+an extraction against its source, not against other extractions.
+
+**Discovered while building, and load-bearing:** LangSmith applies the
+anonymizer to run inputs, outputs and error ONLY — verified against langsmith
+0.9.8, not assumed. Metadata, tags and run names bypass it entirely. So
+`trace_metadata()` enforces the policy itself by not putting a value in the
+dict; there is no second net beneath it. Keys are spelled `email_*` and listed
+in `IDENTIFIER_KEYS` alongside the state spellings so the two channels state
+one policy, with a test pinning the pairing since nothing enforces it at runtime.
+
+**Cost, stated plainly:** this is a privacy loosening, not a display setting.
+Real recruiters' names and addresses reach a third-party SaaS verbatim. It
+defaults false and belongs on only where the traces are yours alone to read.
+
+**Revisit if:** traces become shared with anyone else, or if LangSmith gains
+field-level access control that would let the release be scoped to a viewer.
+
+## D76 — The classifier states its reason, before it states its category (2026-09-02)
+
+**Decision:** `ClassificationResult` gains a required `reason: str` capped at
+200 characters, declared FIRST in the model. It flows into
+`TriageState.classify_reason`, into the classify `NodeEvent` outcome, and from
+there into `agent_activity` (D74) and the LangSmith node run.
+
+**Why:** a category alone is an assertion with no way to check it.
+`not_recruitment` on a real role pitch and on a newsletter are the same two
+words in a trace, so auditing a miscategorisation meant re-reading the email
+and guessing what the model saw. This was the second half of the same
+monitoring gap D75 addresses — D75 finds the run, D76 explains it.
+
+**Field order is the interesting part:** strict structured output is
+grammar-constrained, so the model emits properties in declaration order.
+`reason` first means the justification is generated BEFORE the category it
+justifies, so the label is conditioned on the reasoning rather than the
+reasoning being written to defend a label already chosen. Chain-of-thought for
+the price of a field. Declaring it last reads better as a schema and inverts
+that causality, which is why it is not last.
+
+**Cost:** ~50 output tokens on every classify call — the highest-volume LLM
+call in the pipeline, one per message before any gate. Accepted knowingly.
+
+**Kept an audit string:** `reason` is free text written by a model that just
+read untrusted email. Nothing branches on it, nothing renders it, it never
+reaches an outbound draft. If it ever becomes an input to anything it inherits
+the full prompt-injection surface of the body it summarises.
+
+**Revisit if:** classify volume makes the token cost material, or if reasons
+prove uniformly generic — a reason that fits any email of its category is
+worth nothing and the prompt, not the field, would be at fault.
+
+## D77 — Free-text fields drop their whole subtree, not just their own string (2026-09-02)
+
+**Decision:** redaction now drops a value if ANY ancestor key on its path names
+a free-text carrier, via `_free_text_ancestor`. Previously only the leaf key
+was tested.
+
+**Why — a real leak in shipped strict redaction, found 2026-09-02:**
+`raw_headers` holds a dict, not a string. The anonymizer descended into it and
+handed the replacer the path `["parsed", "raw_headers", "From"]`, whose last
+key is `From` — not in `FREE_TEXT_KEYS`. The value fell through to
+`mask_patterns`, which strips the address and keeps the display name, so
+`Brightpath Careers <[email]>` uploaded to LangSmith out of a field that is on
+the drop list *specifically because* the module comment says it carries the
+sender's display name. The guarantee was stated, tested field-by-field, and
+false for the one field the comment named.
+
+**Why the leaf is excluded from the ancestor check:** `subject` belongs to both
+`FREE_TEXT_KEYS` and D75's `IDENTIFIER_KEYS`. An ancestor check that saw a
+field's own key would drop it before the identifier allowlist was consulted and
+make D75 inert. An ancestor admits no exception; a leaf is decided by the
+ordered rules in `redact`.
+
+**What it generalises:** the same hole opens the first time any message list,
+tool-call block or structured `content` field arrives as a nested object rather
+than a flat string — increasingly likely as LLM payload shapes change under us.
+Nesting can no longer route around a drop.
+
+**Revisit if:** the subtree rule proves too broad in practice — a non-prose
+scalar nested under a prose key that is genuinely wanted in a trace. Nothing
+like that exists today.

@@ -119,6 +119,17 @@ class TriageState(TypedDict, total=False):
     # single-shot. REPLACE is the default and correct.
     category: str
     classify_usage: Usage
+    # The model's one-sentence justification for `category` (D76). Audit only
+    # — no router reads it, and it must stay that way; see the GOTCHA in
+    # app/pipeline/classify.py about where this string came from.
+    # WHY it lives in state rather than only in the NodeEvent: state is what
+    # the checkpoint stores, so "why was this called a newsletter" stays
+    # answerable from a resumed thread months later, and it is what makes the
+    # reason visible on the classify node's run in LangSmith.
+    classify_reason: str | None
+    # Confidence as the model reported it. Carried for the same reason — a
+    # wrong category at 0.99 and a wrong category at 0.41 are different bugs.
+    classify_confidence: float | None
 
     # -------------------------------------------------------------------------
     # Extract — one node, may retry internally but returns once.

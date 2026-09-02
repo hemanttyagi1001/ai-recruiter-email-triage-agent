@@ -30,6 +30,23 @@ ALTERNATIVE considered and rejected: mask emails/phones inside body_text and
   If it is ever wanted, it belongs here as a second replacer selected by an
   explicit setting, NOT as a loosening of this one.
 
+CONCEPT: the second replacer, which is now real (D75).
+  The paragraph above prescribed the shape and this module now implements it.
+  `identifiers=True` — driven by LANGSMITH_TRACE_IDENTIFIERS, never by
+  anything else — moves exactly three fields (subject, from_name, from_email)
+  out of the dropped set and passes them through UNMASKED. It does not widen
+  the prose rule by one byte: body_text, jd_text, draft_body, raw_headers,
+  content and text are dropped whole in both modes.
+  WHY unmasked rather than pattern-masked for those three: the entire purpose
+  is answering "which email is this, and who sent it". `_EMAIL_RE` would
+  rewrite from_email to `[email]`, which is precisely the information being
+  asked for. A half-measure here would cost the privacy and not buy the
+  monitoring, which is the worst of both.
+  GOTCHA: `identifiers` is a keyword-only argument with a False default on
+  every function here. That is deliberate — a caller that forgets it gets
+  STRICT behaviour, so the failure mode of a future refactor is a less useful
+  trace rather than an unredacted one.
+
 GOTCHA: this module must not import anything from app.pipeline or app.llm.
   It runs INSIDE the tracer's serialisation path. An import cycle here
   surfaces as a hang or a partial upload during tracing, which is a miserable
@@ -78,6 +95,26 @@ FREE_TEXT_KEYS: frozenset[str] = frozenset({
     "text",
 })
 
+# The three fields that identify a message without describing it, released
+# only when `identifiers=True`. Anything not on this list stays governed by
+# FREE_TEXT_KEYS above — note `recruiter_name`, `company` and `end_client` are
+# deliberately NOT here. Those are EXTRACTED values, and the point of a trace
+# you are auditing for correctness is to check the extraction against a source
+# you already trust; the From header and the Subject line are that source.
+# WHY the metadata spellings sit beside the state ones: app/observability/
+# tracing.py stamps the same three values into run metadata under `email_*`
+# names, and LangSmith does not run metadata through the anonymizer at all.
+# Listing both spellings means the two channels cannot drift into disagreeing
+# about what is releasable — one list, one policy.
+IDENTIFIER_KEYS: frozenset[str] = frozenset({
+    "subject",
+    "from_name",
+    "from_email",
+    "email_subject",
+    "email_from_name",
+    "email_from",
+})
+
 # Structured patterns. Applied to every string we did NOT drop wholesale.
 # GOTCHA: order matters. Email must run before phone, because an address like
 # `asha.9876543210@corp.in` contains a phone-shaped run of digits; masking the
@@ -111,6 +148,46 @@ def _last_key(path: list[str | int]) -> str | None:
     return None
 
 
+def _free_text_ancestor(path: list[str | int]) -> bool:
+    """True if a key ABOVE the leaf names a free-text carrier.
+
+    WHY the leaf is excluded rather than included: the leaf's own key is
+    handled separately, further down `redact`, and it has to be — `subject` is
+    a member of BOTH FREE_TEXT_KEYS and IDENTIFIER_KEYS, so a check that saw
+    its own key here would drop it before the identifier allowlist was
+    consulted and the setting would appear inert. An ANCESTOR, by contrast,
+    admits no exception: a string sitting inside `raw_headers` or inside an
+    LLM `content` block is part of that prose no matter what it is called, so
+    it drops before anything else is asked.
+
+    GOTCHA this exists to fix — a real leak, found 2026-09-02.
+      Matching on the LAST key alone is correct only when the free-text field
+      holds a string. `raw_headers` holds a DICT, so the anonymizer descends
+      into it and hands us the path ["parsed", "raw_headers", "From"] with
+      "From" as the last key. "From" is not in FREE_TEXT_KEYS, so the value
+      fell through to mask_patterns, which strips the address and keeps the
+      display name — publishing "Brightpath Careers <[email]>" to LangSmith
+      out of a field listed in FREE_TEXT_KEYS *specifically because* the
+      module comment says it "contains the sender's display name".
+      Checking every key on the path means a free-text field drops its whole
+      SUBTREE, not just its own string, so nesting can no longer route around
+      the rule. The same hole would have opened the first time any message
+      list, tool-call block or structured content field arrived as a nested
+      object rather than a flat string.
+    """
+    seen_leaf = False
+    for part in reversed(path):
+        if not isinstance(part, str):
+            continue
+        if not seen_leaf:
+            # The nearest string key is the leaf's own name — skip it.
+            seen_leaf = True
+            continue
+        if part in FREE_TEXT_KEYS:
+            return True
+    return False
+
+
 def mask_patterns(value: str) -> str:
     """Mask structured identifiers inside a string that we are keeping."""
     for pattern, replacement in _PATTERNS:
@@ -118,7 +195,7 @@ def mask_patterns(value: str) -> str:
     return value
 
 
-def redact(value: str, path: list[str | int]) -> str:
+def redact(value: str, path: list[str | int], *, identifiers: bool = False) -> str:
     """The replacer handed to LangSmith: one string in, one safe string out.
 
     TRACE: called once per string in the trace payload, on the upload path,
@@ -129,7 +206,21 @@ def redact(value: str, path: list[str | int]) -> str:
     GOTCHA: this function must never raise. See `safe_redact` — it is the one
     that is actually installed, and this is the body it guards.
     """
+    # The three checks below are ordered, and the order is the whole logic:
+    #   1. Anything INSIDE a prose field drops. No exception, either mode.
+    #   2. Otherwise, an allowlisted identifier is released — but only when
+    #      the setting is on. `subject` and `from_name` are members of both
+    #      sets, so testing FREE_TEXT_KEYS before this would drop them before
+    #      the allowlist was ever consulted and the setting would appear
+    #      inert — a bug that reads as "tracing is broken" rather than as an
+    #      ordering mistake.
+    #   3. Otherwise the ordinary rule: prose drops, everything else is
+    #      pattern-masked.
     key = _last_key(path)
+    if _free_text_ancestor(path):
+        return DROPPED
+    if identifiers and key is not None and key in IDENTIFIER_KEYS:
+        return value
     if key is not None and key in FREE_TEXT_KEYS:
         # No pattern matching attempted. See the module CONCEPT: prose is not
         # sanitisable, so it does not travel.
@@ -137,7 +228,9 @@ def redact(value: str, path: list[str | int]) -> str:
     return mask_patterns(value)
 
 
-def safe_redact(value: str, path: list[str | int]) -> str:
+def safe_redact(
+    value: str, path: list[str | int], *, identifiers: bool = False
+) -> str:
     """`redact`, but a failure yields the placeholder instead of the original.
 
     CONCEPT: fail-closed on the redactor itself.
@@ -156,7 +249,7 @@ def safe_redact(value: str, path: list[str | int]) -> str:
     try:
         if not isinstance(value, str):
             return PLACEHOLDER
-        return redact(value, path)
+        return redact(value, path, identifiers=identifiers)
     except Exception as exc:
         log.warning(
             "redaction failed at path %r (%s: %s); emitting placeholder",
@@ -165,7 +258,7 @@ def safe_redact(value: str, path: list[str | int]) -> str:
         return PLACEHOLDER
 
 
-def build_anonymizer():
+def build_anonymizer(*, identifiers: bool = False):
     """Return the callable LangSmith applies to every trace payload.
 
     `create_anonymizer` accepts a replacer of shape
@@ -177,12 +270,30 @@ def build_anonymizer():
     this module — which the tests exercise directly — fail to import in an
     environment that has trimmed it. The pure functions above stay testable
     with no langsmith installed at all.
+
+    GOTCHA: `identifiers` is bound into the closure HERE, at client-build
+    time, and the client is built once per process (tracing.get_client is
+    lru_cached). Flipping the setting therefore needs a restart, exactly like
+    LANGSMITH_TRACING itself. Anything that reads the flag per-call would
+    imply it could change mid-run, which it cannot.
     """
     from langsmith.anonymizer import create_anonymizer
 
-    return create_anonymizer(safe_redact)
+    def replacer(value: Any, path: list[str | int]) -> str:
+        return safe_redact(value, path, identifiers=identifiers)
+
+    return create_anonymizer(replacer)
 
 
-def redact_payload(payload: Any) -> Any:
-    """Convenience wrapper used by the tests to check whole-payload behaviour."""
-    return build_anonymizer()(payload)
+def redact_payload(payload: Any, *, identifiers: bool = False) -> Any:
+    """Convenience wrapper used by the tests to check whole-payload behaviour.
+
+    GOTCHA: the anonymizer MUTATES `payload` in place and returns it — it is
+    not a pure function, whatever the return value suggests. Redacting the
+    same dict twice therefore redacts the already-redacted copy, which reads
+    as "the identifier release did nothing" and sends you looking for a bug in
+    `redact`. Build a fresh payload per call. This is harmless in production,
+    where LangSmith hands it a serialised copy it owns, and a trap in any
+    script that loops over modes to compare them.
+    """
+    return build_anonymizer(identifiers=identifiers)(payload)

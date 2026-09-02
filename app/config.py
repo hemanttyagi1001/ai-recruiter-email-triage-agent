@@ -175,6 +175,29 @@ class Settings(BaseSettings):
     langsmith_api_key: str | None = Field(default=None)
     langsmith_project: str = Field(default="recruiter-triage")
 
+    # CONCEPT: the one dial that widens what redaction lets through, and the
+    # reason it is a dial rather than an edit.
+    #   Strict redaction drops `subject` and `from_name` with the rest of the
+    #   free text, which is correct for privacy and useless for the job of
+    #   MONITORING — a run list where every row reads "[REDACTED:free-text]"
+    #   cannot answer "which email is this, and did it get the right
+    #   category". Turning this on keeps three identifier fields — subject,
+    #   sender name, sender address — and nothing else. Bodies, JD text and
+    #   draft bodies stay dropped whole in BOTH modes.
+    # WHY this does not contradict the "hard rules live in code" principle
+    #   that keeps redaction out of config (see the langsmith_tracing comment
+    #   above): the hard rule is "prose is not sanitisable, so prose does not
+    #   travel", and that rule is unchanged and untouchable by this flag. What
+    #   this flag selects is which of two AUDITED replacers runs, both of
+    #   which enforce that rule. redaction.py anticipated exactly this shape.
+    # GOTCHA: this is a genuine privacy loosening, not a display setting.
+    #   Recruiter display names, their addresses and subject lines reach a
+    #   third-party SaaS verbatim when it is on — including via run names and
+    #   metadata, which LangSmith does NOT pass through the anonymizer at all.
+    #   Default false, and it should stay false anywhere the traces are not
+    #   yours alone to read. See D75.
+    langsmith_trace_identifiers: bool = Field(default=False)
+
     # --- Logging ---
     log_dir: Path = Field(default=Path("logs"))
 

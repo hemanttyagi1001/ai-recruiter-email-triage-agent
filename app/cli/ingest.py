@@ -31,7 +31,12 @@ from app.db.models import Message, MessageStatus, Run, RunStatus
 from app.gmail.client import GmailClient
 from app.gmail.parser import parse_message
 from app.llm.client import LLMClient
-from app.observability.tracing import trace_callbacks
+from app.observability.tracing import (
+    trace_callbacks,
+    trace_metadata,
+    trace_run_name,
+    trace_tags,
+)
 from app.pipeline.checkpointer import open_checkpointer
 from app.pipeline.graph import build_graph
 from app.retry import PermanentExternalError
@@ -269,9 +274,20 @@ def _process_one(gmail_id, gmail, graph, run_id, counters) -> None:
     # this one tracer produces a run tree per message — a parent run for the
     # graph and a child per node — with every string passed through the
     # redactor in app/observability/redaction.py before upload.
+    # D75: `run_name`, `metadata` and `tags` are what make that tree findable
+    # in the LangSmith list view. All three collapse to None/{}/[] when
+    # tracing is off, and the two identifier-bearing ones stay empty unless
+    # LANGSMITH_TRACE_IDENTIFIERS is also on — so this stays a flat dict with
+    # no branch at the call site, the same argument as trace_callbacks().
+    # GOTCHA: these three do NOT pass through the anonymizer; LangSmith only
+    # anonymises inputs/outputs/error. The policy is enforced inside
+    # trace_metadata(), not here. Do not inline a parsed field into this dict.
     config = {
         "configurable": {"thread_id": parsed.message_id},
         "callbacks": trace_callbacks(),
+        "run_name": trace_run_name(parsed),
+        "metadata": trace_metadata(parsed, run_id),
+        "tags": trace_tags(),
     }
     final_state = graph.invoke({"parsed": parsed, "run_id": run_id}, config=config)
 
