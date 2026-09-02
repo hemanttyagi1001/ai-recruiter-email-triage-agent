@@ -75,18 +75,29 @@ def get_client() -> Any | None:
 
     client = Client(
         api_key=settings.langsmith_api_key,
-        # CONCEPT: `anonymizer` runs on inputs, outputs and metadata before
+        # CONCEPT: `anonymizer` runs on run INPUTS, OUTPUTS and ERROR before
         # upload. It is a transform, not a filter — the run still appears in
         # LangSmith with its timings, token counts and tree structure intact;
         # only the strings are rewritten. That is what makes strict redaction
         # tolerable: the shape of the run, which is what you debug routing
         # with, survives it.
-        anonymizer=build_anonymizer(),
+        # GOTCHA — the scope of that list is exact and was verified against
+        # langsmith 0.9.8, not assumed. `Client._anonymizer` is applied in
+        # three places: json_inputs, json_outputs, and {"error": error}. It is
+        # NOT applied to run metadata, tags, or the run name. Anything this
+        # module stamps into those three channels is therefore uploaded
+        # VERBATIM, which is why trace_metadata() below enforces the identifier
+        # policy itself instead of delegating it. Do not add a field there on
+        # the assumption the redactor will catch it — it will not.
+        anonymizer=build_anonymizer(identifiers=settings.langsmith_trace_identifiers),
     )
     log.info(
-        "LangSmith tracing ENABLED for project %r with strict redaction "
-        "(free-text fields are dropped, not masked).",
+        "LangSmith tracing ENABLED for project %r (identifiers=%s). Free-text "
+        "fields are dropped, not masked, in both modes.",
         settings.langsmith_project,
+        "VISIBLE — subject and sender upload unmasked"
+        if settings.langsmith_trace_identifiers
+        else "redacted",
     )
     return client
 
@@ -117,6 +128,118 @@ def trace_callbacks() -> list[Any]:
     """
     tracer = get_tracer()
     return [tracer] if tracer is not None else []
+
+
+# -----------------------------------------------------------------------------
+# Making a run identifiable in the LangSmith list view
+# -----------------------------------------------------------------------------
+#
+# CONCEPT: a trace you cannot find is a trace you do not have.
+#   Strict redaction leaves every run in the project titled with LangGraph's
+#   default name and carrying `[REDACTED:free-text]` where the subject was.
+#   Correct, and unusable for the actual monitoring question — "is THIS email
+#   in the right category?" — because you cannot tell the rows apart to pick
+#   the one you mean. These three functions attach the three things LangSmith
+#   surfaces in a list: a NAME (what you read), METADATA (what you filter on)
+#   and TAGS (what you slice a whole project by).
+#
+# GOTCHA: all three bypass the anonymizer entirely (see get_client). The
+#   policy is enforced here, in the builders, by simply not putting a value in
+#   the dict when identifiers are off. There is no second net below this one.
+
+# WHY truncate: the subject is a display string in a list view, and a
+# 300-character forwarded subject pushes everything else off the row. 80 is
+# about what the LangSmith run list shows before eliding.
+_SUBJECT_DISPLAY_CHARS = 80
+
+
+def _identifiers_on() -> bool:
+    """Both flags must be true. Tracing off means nothing is uploaded at all,
+    so the identifier setting alone can never leak anything on its own."""
+    return bool(settings.langsmith_tracing and settings.langsmith_trace_identifiers)
+
+
+def trace_run_name(parsed: Any) -> str | None:
+    """The title of this message's run tree, or None to keep LangGraph's.
+
+    Returns None rather than a placeholder when identifiers are off: a run
+    named "triage" repeated 200 times is worse than the default, which at
+    least names the graph.
+
+    TRACE: consumed by graph.invoke(config={"run_name": ...}) in
+    app/cli/ingest.py. LangGraph applies it to the ROOT run only; child node
+    runs keep their node names, which is what you want — the tree reads
+    "Priya Sharma — Senior AI/ML Engineer" → classify → extract → …
+    """
+    if not _identifiers_on():
+        return None
+    subject = (parsed.subject or "(no subject)").strip()
+    if len(subject) > _SUBJECT_DISPLAY_CHARS:
+        subject = subject[: _SUBJECT_DISPLAY_CHARS - 1].rstrip() + "…"
+    sender = parsed.from_name or parsed.from_email or "unknown sender"
+    return f"{sender} — {subject}"
+
+
+def trace_metadata(parsed: Any, run_id: Any = None) -> dict[str, Any]:
+    """Filterable key/values for this run. Empty dict when tracing is off.
+
+    CONCEPT: metadata is the half of this that does the real work. LangSmith
+    lets you filter a project on a metadata key, so stamping the ingest run id
+    here is what turns "show me everything from the 09:15 cycle" into one
+    query, and `email_from` is what turns "every mail this recruiter ever
+    sent" into another.
+
+    GOTCHA: `message_id` looks like new exposure and is not. LangGraph already
+    copies `configurable.thread_id` — which IS the RFC 5322 Message-ID, by
+    D18 — into run metadata on every trace, unredacted, and has since tracing
+    was first wired. Naming it explicitly here changes nothing about what
+    leaves the process and makes the correlation key visible to a reader
+    instead of hidden in framework-stamped fields.
+    """
+    if get_client() is None:
+        return {}
+    meta: dict[str, Any] = {
+        # Correlation keys: these three are what join a LangSmith run back to
+        # the `messages`, `runs` and `agent_activity` rows in Postgres.
+        "message_id": parsed.message_id,
+        "gmail_id": parsed.gmail_id,
+        # Configuration in force for this run. WHY on every message rather
+        # than assumed from the project: these change between cycles, and a
+        # trace that does not record which mode produced it cannot answer
+        # "was this the run where auto-send was armed?".
+        "auto_send_mode": settings.auto_send_mode,
+        "draft_mode": settings.draft_mode,
+        "gmail_label": settings.gmail_label,
+    }
+    if run_id is not None:
+        # str() because metadata is JSON-serialised and UUID is not
+        # JSON-native — the same reason _finalise_run stringifies Decimal.
+        meta["run_id"] = str(run_id)
+    if _identifiers_on():
+        # The identifier release. Key names match IDENTIFIER_KEYS in
+        # redaction.py so the two channels state one policy, even though
+        # nothing re-checks these on the way out.
+        meta["email_subject"] = parsed.subject
+        meta["email_from"] = parsed.from_email
+        meta["email_from_name"] = parsed.from_name
+    return meta
+
+
+def trace_tags() -> list[str]:
+    """Project-wide slices. Never message-specific, never personal.
+
+    WHY tags and metadata both: a LangSmith tag is a coarse filter you can
+    click, and it must stay low-cardinality to be useful. Anything that varies
+    per message belongs in metadata; anything that varies per deployment
+    belongs here.
+    """
+    if get_client() is None:
+        return []
+    return [
+        f"label:{settings.gmail_label}",
+        f"send:{settings.auto_send_mode}",
+        f"draft:{settings.draft_mode}",
+    ]
 
 
 def wrap_llm_client(azure_client: Any) -> Any:

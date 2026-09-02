@@ -98,8 +98,11 @@ def _make_parsed(i: int) -> ParsedMessage:
 
 def _queue_happy_path(fake_llm, usage_factory) -> None:
     """Queue the 3 LLM responses per message: classify, extract, score."""
-    fake_llm.queue((ClassificationResult(category="new_role_pitch", confidence=0.95),
-                    usage_factory(80, 10)))
+    # `reason` is required as of D76 — the classifier must justify its label.
+    fake_llm.queue((ClassificationResult(
+        reason="body opens 'we have an opening for' with a named role and CTC",
+        category="new_role_pitch", confidence=0.95,
+    ), usage_factory(80, 10)))
     fake_llm.queue((Opportunity(
         company="Acme", role_title="Backend Engineer",
         ctc_min_lpa=45, ctc_max_lpa=55,

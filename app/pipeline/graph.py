@@ -126,10 +126,25 @@ def _make_classify_node(llm: LLMClient):
     def n(state: TriageState) -> dict:
         parsed = state["parsed"]
         result, usage = classify(parsed.subject, parsed.body_text, llm)
+        # D76: the event outcome carries the verdict AND its justification.
+        # TRACE: this one string is the reason the feature is cheap. It lands
+        # in three places at once with no further plumbing — the LangSmith run
+        # for this node (as part of the returned dict), the checkpoint, and
+        # the agent_activity table, because ingest.py flushes every NodeEvent
+        # there (D74). Querying "which mails were called not_recruitment last
+        # week, and why" is then plain SQL over one column.
         return {
             "category": result.category,
+            "classify_reason": result.reason,
+            "classify_confidence": result.confidence,
             "classify_usage": usage,
-            "events": [make_event("classify", outcome=f"category={result.category}")],
+            "events": [make_event(
+                "classify",
+                outcome=(
+                    f"category={result.category} "
+                    f"confidence={result.confidence:.2f} — {result.reason}"
+                ),
+            )],
         }
     return n
 

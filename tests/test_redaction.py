@@ -111,7 +111,11 @@ def test_replacer_never_raises_and_never_returns_the_original(monkeypatch):
     """
     import app.observability.redaction as redaction
 
-    def boom(value, path):
+    # **kw so the stub matches `redact`'s keyword-only `identifiers` argument.
+    # Without it the call would fail with TypeError instead of RuntimeError —
+    # still fail-closed, but it would be the arity blowing up rather than the
+    # redactor, which is not what this test claims to prove.
+    def boom(value, path, **kw):
         raise RuntimeError("redactor blew up mid-walk")
 
     monkeypatch.setattr(redaction, "redact", boom)
@@ -125,7 +129,9 @@ def test_a_broken_redactor_leaks_nothing_from_a_whole_payload(monkeypatch):
     import app.observability.redaction as redaction
 
     monkeypatch.setattr(
-        redaction, "redact", lambda value, path: (_ for _ in ()).throw(RuntimeError())
+        redaction,
+        "redact",
+        lambda value, path, **kw: (_ for _ in ()).throw(RuntimeError()),
     )
     dumped = json.dumps(redaction.redact_payload(_realistic_payload()))
     for leak in ("priya", "brightpathtech", "98765", "Sharma"):
@@ -204,3 +210,126 @@ def test_redaction_preserves_structure_and_non_pii_scalars():
     # Numbers are not strings; the replacer never sees them, so the shape of
     # the state (and anything numeric a router branched on) still reads.
     assert redacted["inputs"]["opportunity"]["ctc_max_lpa"] == 32
+
+
+# --- The identifier release (D75) -------------------------------------------
+#
+# These assert BOTH directions, and the strict direction is the important one:
+# the whole risk of adding a second replacer is that it silently becomes the
+# only replacer. Every test below that turns identifiers on has a twin above
+# or beside it proving the default still drops the same field.
+
+
+@pytest.mark.parametrize("key", ["subject", "from_name", "from_email"])
+def test_identifier_fields_survive_only_when_identifiers_are_on(key):
+    value = "Priya Sharma <priya.sharma@brightpathtech.in>"
+    assert redact(value, ["inputs", key], identifiers=True) == value
+    # And the default — no keyword passed at all — is unchanged behaviour.
+    assert redact(value, ["inputs", key]) != value
+
+
+def test_identifiers_default_to_off_at_every_layer():
+    """A caller that forgets the keyword must get STRICT, not permissive.
+
+    This is the test that would catch the dangerous refactor: someone adds a
+    call site, omits `identifiers=`, and the default silently releases.
+    """
+    assert redact("Senior AI/ML Engineer", ["inputs", "subject"]) == DROPPED
+    assert safe_redact("Senior AI/ML Engineer", ["inputs", "subject"]) == DROPPED
+    dumped = json.dumps(redact_payload(_realistic_payload()))
+    assert "Opening for Senior AI/ML Engineer" not in dumped
+
+
+@pytest.mark.parametrize(
+    "key", ["body_text", "jd_text", "draft_body", "raw_headers", "content", "text"]
+)
+def test_prose_is_still_dropped_whole_with_identifiers_on(key):
+    """The load-bearing guarantee: the flag releases three fields, not prose.
+
+    If this ever fails, the setting has stopped being an identifier release
+    and become a redaction off-switch.
+    """
+    prose = "Hi Hemant, Priya here from Brightpath about a 32 LPA role."
+    assert redact(prose, ["inputs", key], identifiers=True) == DROPPED
+
+
+@pytest.mark.parametrize("key", ["recruiter_name", "company", "end_client"])
+def test_extracted_identity_fields_are_not_released(key):
+    """Only the From header and Subject are released — not what the model read
+    out of the body. Auditing an extraction against extracted values proves
+    nothing; you check it against the source, which is why the source is the
+    thing on the allowlist."""
+    assert redact("Brightpath Tech", ["outputs", key], identifiers=True) == DROPPED
+
+
+def test_metadata_key_spellings_are_released_too():
+    """tracing.py stamps these names into run metadata, which LangSmith does
+    NOT anonymise. They are on the allowlist so the two channels state one
+    policy even though only this one is enforced by the replacer."""
+    for key in ("email_subject", "email_from", "email_from_name"):
+        assert redact("priya@corp.in", ["metadata", key], identifiers=True) == "priya@corp.in"
+        assert redact("priya@corp.in", ["metadata", key]) != "priya@corp.in"
+
+
+def test_identifiers_on_releases_exactly_the_three_and_nothing_else():
+    """Whole-payload twin of test_no_pii_survives_anywhere, for the loose mode.
+
+    The subject and the From header come through; the body, the JD, the draft
+    and the recruiter's phone number still do not.
+
+    WHY the released half is asserted on the STRUCTURE and the withheld half
+    on the serialised dump: they are different questions. "Did the subject
+    come through" must name the field, or it passes on a copy of the subject
+    leaking from somewhere else entirely — which is exactly the bug
+    test_sender_display_name_does_not_survive_via_raw_headers covers.
+    "Did the body leak" must NOT name a field, for the reason given on
+    test_no_pii_survives_anywhere_in_a_realistic_payload.
+    """
+    redacted = redact_payload(_realistic_payload(), identifiers=True)
+    parsed = redacted["inputs"]["parsed"]
+    assert parsed["subject"] == "Opening for Senior AI/ML Engineer"
+    assert parsed["from_email"] == "careers@brightpathtech.in"
+    assert parsed["from_name"] == "Brightpath Careers"
+    assert parsed["body_text"] == DROPPED
+
+    dumped = json.dumps(redacted)
+    # Still gone. Note priya.sharma@ is the RECRUITER address extracted from
+    # the body, not the From header — a different field and a different rule.
+    for leak in ("Priya Sharma", "98765", "32 LPA", "priya.sharma@brightpathtech.in"):
+        assert leak not in dumped
+
+
+@pytest.mark.parametrize("identifiers", [False, True])
+def test_sender_display_name_does_not_survive_via_raw_headers(identifiers):
+    """Regression, 2026-09-02 — a real leak in shipped strict redaction.
+
+    `raw_headers` holds a dict, so the anonymizer descended into it and the
+    last key was the HEADER NAME ("From"), which is not in FREE_TEXT_KEYS. The
+    value fell through to mask_patterns, which strips the address and leaves
+    the display name: `Brightpath Careers <[email]>` uploaded out of a field
+    that is on the drop list precisely because it carries that name.
+
+    Asserted in BOTH modes: the identifier release covers the From header as
+    a parsed FIELD, never as raw header prose.
+    """
+    out = redact(
+        "Brightpath Careers <careers@brightpathtech.in>",
+        ["inputs", "parsed", "raw_headers", "From"],
+        identifiers=identifiers,
+    )
+    assert out == DROPPED
+    assert "Brightpath" not in out
+
+
+def test_a_prose_subtree_drops_whatever_the_inner_keys_are_called():
+    """Generalisation of the bug above: nesting must not route around a drop.
+
+    An inner key that happens to be on the identifier allowlist does not earn
+    a release when it sits inside a prose field — the ancestor decides.
+    """
+    for path in (
+        ["inputs", "messages", 0, "content", "subject"],
+        ["inputs", "parsed", "raw_headers", "Reply-To"],
+        ["outputs", "draft_body", "from_name"],
+    ):
+        assert redact("Priya Sharma", path, identifiers=True) == DROPPED
