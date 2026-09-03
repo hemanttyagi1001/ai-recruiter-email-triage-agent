@@ -528,6 +528,48 @@ class GmailClient:
             )
             return False
 
+    def trash_message(self, gmail_id: str) -> bool:
+        """Move a message to Gmail's Trash. True if Gmail confirmed it.
+
+        CONCEPT: trash is not delete, and the difference is the whole safety
+          argument. `messages.trash` sets the TRASH label — the message leaves
+          the inbox, stops counting against the fetch window, and Gmail purges
+          it after 30 days. Until then it is recoverable by the user with one
+          click. `messages.delete` is the irreversible one, and it requires the
+          full `https://mail.google.com/` scope which this client deliberately
+          does not request (see SCOPES above). So the narrow scope is not just
+          documentation of intent — it makes the irreversible call impossible
+          rather than merely unused.
+
+        TRACE: called only from the inbox_cleanup node, only for messages
+        ingest already classified as non-delivery reports by
+        app/rules/undeliverable.py, and only when INBOX_CLEANUP_MODE=trash and
+        the kill switch is off. Never on the reply path.
+
+        GOTCHA: does not raise, for the same reason as mark_read. This runs
+        AFTER persist_terminal has written the message row (D78 ordering), so
+        a failure here leaves an accurate database and an untidy inbox — the
+        harmless direction. Raising would climb into the ingest CLI's
+        per-message handler and dead-letter a message that was processed
+        perfectly well.
+
+        GOTCHA: requires the gmail.modify scope, same as mark_read. Returns
+        False and logs on a token that predates it.
+        """
+        try:
+            self.service.users().messages().trash(userId="me", id=gmail_id).execute()
+            log.info("trashed gmail_id=%s (non-delivery report)", gmail_id)
+            return True
+        except Exception as exc:
+            log.warning(
+                "trash_message failed for gmail_id=%s (%s: %s); the message "
+                "row is already written, so continuing. If this says "
+                "insufficientPermissions, delete token.json and re-run "
+                "`python -m app.gmail.auth` to consent to gmail.modify.",
+                gmail_id, type(exc).__name__, exc,
+            )
+            return False
+
     @retry_external(node="gmail_create_draft")
     def create_draft(
         self,

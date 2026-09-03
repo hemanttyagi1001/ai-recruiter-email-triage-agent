@@ -19,6 +19,7 @@ import time
 from app.db.engine import session_scope
 from app.db.models import Message, MessageStatus
 from app.pipeline.state import TriageState, make_event
+from app.rules.undeliverable import is_undeliverable
 
 
 def ingest_node(state: TriageState) -> dict:
@@ -48,6 +49,30 @@ def ingest_node(state: TriageState) -> dict:
                 make_event(
                     "ingest",
                     outcome=f"duplicate: existing status={already_status}",
+                    duration_ms=duration_ms,
+                )
+            ],
+        }
+
+    # D79: a bounce is recognised HERE, before classify, and never reaches an
+    # LLM at all. Placing it in this node rather than adding an eighth
+    # classifier category is what makes it free — the observed mailbox held 30
+    # non-delivery reports, each of which had been paying for a classify call
+    # to be told it was not recruitment mail.
+    # TRACE: setting final_status routes to persist_terminal via
+    # _route_after_ingest (the same edge the duplicate check above uses), which
+    # writes the row and then hands to inbox_cleanup. Nothing is trashed until
+    # that row exists — see D78 for why that order is not negotiable.
+    if is_undeliverable(parsed):
+        return {
+            "final_status": MessageStatus.SKIPPED_UNDELIVERABLE,
+            "events": [
+                make_event(
+                    "ingest",
+                    outcome=(
+                        f"non-delivery report from {parsed.from_email}; "
+                        f"skipping before classify"
+                    ),
                     duration_ms=duration_ms,
                 )
             ],

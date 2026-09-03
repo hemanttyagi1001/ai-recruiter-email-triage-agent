@@ -291,14 +291,29 @@ def persist_terminal(state: TriageState) -> dict:
     needs_review = state.get("needs_review", False)
     now = datetime.now(timezone.utc)
 
-    final_status = _terminal_status(
-        category=category,
-        opportunity=opportunity,
-        extraction_error=extraction_error,
-        needs_review=needs_review,
-        reply_to=state.get("reply_to"),
-        already_replied=bool(state.get("already_replied")),
-    )
+    # D79: ingest can settle the terminal status before any other node runs.
+    # A non-delivery report is recognised deterministically from the sender and
+    # subject, so there is no category, no opportunity and no reply target for
+    # _terminal_status to reason about — left to itself it would derive
+    # FETCHED, which says "we have not decided yet" about a message we decided
+    # about immediately.
+    # WHY only this one status is honoured rather than any preset value: the
+    # duplicate path through _route_after_ingest also arrives here carrying a
+    # final_status (the EXISTING row's status), and that one must NOT overwrite
+    # what the derivation produces for a fresh row. Narrowing to the single
+    # value ingest is entitled to decide keeps the two cases apart.
+    preset = state.get("final_status")
+    if preset == MessageStatus.SKIPPED_UNDELIVERABLE:
+        final_status = MessageStatus.SKIPPED_UNDELIVERABLE
+    else:
+        final_status = _terminal_status(
+            category=category,
+            opportunity=opportunity,
+            extraction_error=extraction_error,
+            needs_review=needs_review,
+            reply_to=state.get("reply_to"),
+            already_replied=bool(state.get("already_replied")),
+        )
 
     with session_scope() as s:
         if s.get(Message, parsed.message_id) is not None:

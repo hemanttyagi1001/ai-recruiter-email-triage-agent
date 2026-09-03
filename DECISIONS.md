@@ -1605,3 +1605,64 @@ a larger change than a hotfix should carry.
 
 **Revisit if:** the ordering issue recurs anywhere (it would mean a new mapper
 pair with a bare ForeignKey), or when the intent-row change above is taken on.
+## D79 — Bounces are detected in code and trashed, gated three ways (2026-09-03)
+
+**Decision:** `ingest_node` recognises non-delivery reports deterministically
+(`app/rules/undeliverable.py`) before any LLM call, `persist_terminal` records
+them as `SKIPPED_UNDELIVERABLE`, and a new `inbox_cleanup` node moves them to
+Gmail's Trash when `INBOX_CLEANUP_MODE=trash` and the kill switch is off.
+
+**Why:** the agent sends mail, so it receives bounces about mail that failed.
+30 had accumulated in the observed mailbox, each one paying for a classify call
+to be told it was not recruitment, and each one consuming a slot in the
+200-message fetch window that a real recruiter could have had.
+
+**Why code and not an eighth classifier category:** the classifier already
+files these correctly as not_recruitment, which is enough to stop them being
+answered but not enough to justify DELETING someone's mail. A model that is 99%
+right on 200 messages a day is wrong twice a day, and here "wrong" means a
+recruiter's mail in the bin. Same argument as D11 for the decline rules and D14
+for the outbound validator. Running it at ingest also makes it free.
+
+**Detection, and the negative case that shaped it:** sender local part is
+`mailer-daemon`/`postmaster` (anchored, whole-token), OR the subject carries an
+NDR phrase. Every phrase is multi-word, because the observed inbox contains
+`shipment-tracking@amazon.in` / "Out for delivery: ..." and a bare `delivery`
+token would have trashed it. "Delivery Manager" is also a real job title. That
+case is a pinned test.
+
+**Trash, not delete:** `messages.trash` is recoverable for 30 days.
+`messages.delete` needs the full `https://mail.google.com/` scope, which the
+client deliberately does not request — so the narrow scope makes the
+irreversible call impossible rather than merely unused. There is no `delete`
+mode for the same reason.
+
+**Ordering, straight from D78:** the messages row is written by
+`persist_terminal` BEFORE `inbox_cleanup` runs. If the trash call fails, the
+result is an accurate database and an untidy inbox. The reverse order would
+delete the evidence of what was deleted, and is the shape that caused the
+duplicate-draft incident the day before.
+
+**Three gates, and a departure from D49:** the message must be a bounce by code
+rule, the mode must be `trash`, and the kill switch must be off. D49 exempts
+draft mode from the switch on the argument that a draft is not outbound mail.
+That argument does not transfer: trashing is not less consequential than
+sending, and "it kept deleting my mail, but it never sent anything" is not a
+defensible outcome for a switch someone pulled in a panic. The cleanup node
+also re-checks the status the router already branched on — two independent
+checks for an irreversible action.
+
+**Default `off` although the operator runs it armed:** this repository is
+public, and a default that silently trashes mail for anyone who clones it is a
+hazard that was not intended for strangers. Arming is one line in `.env`, which
+is where a decision about one specific mailbox belongs.
+
+**Backfill is a separate manual CLI:** `app/cli/trash_bounces.py`, dry-run by
+default, `--apply` to act. Bounces already in the `messages` table are skipped
+by the gmail_id guard and the live path will never see them. It imports the
+same detector rather than reimplementing it, so the two cannot drift.
+
+**Revisit if:** a bounce format appears that neither signal catches (add a
+phrase), or if a false positive is ever observed — in which case the sender
+check should tighten before the subject check, since the subject is the half
+attacker-controlled by whoever chose the original subject line.
