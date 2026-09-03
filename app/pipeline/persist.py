@@ -106,6 +106,16 @@ def persist_pending(state: TriageState) -> dict:
                 status=MessageStatus.AWAITING_APPROVAL,
             )
         )
+        # D78: force the parent row out before anything that references it.
+        # The Draft below carries a FK to messages.message_id, and until the
+        # relationship() added to models.py the unit of work had no idea these
+        # two INSERTs were ordered — it could emit the child first, get a FK
+        # violation, and roll back the whole transaction including this row.
+        # GOTCHA: this looks redundant now that the relationship exists, and
+        # it is kept deliberately. It is one cheap round-trip that makes the
+        # ordering true at the point a reader is looking at, rather than true
+        # because of a declaration 200 lines away in another module.
+        s.flush()
 
         opp_id = None
         if opportunity is not None:
@@ -475,6 +485,14 @@ def persist_auto(state: TriageState) -> dict:
                 status=msg_status,
             )
         )
+        # D78 — this is the exact line whose absence caused the incident.
+        # TRACE: reaching here means auto_send has ALREADY created a Gmail
+        # draft. If this transaction dies, that draft exists with nothing in
+        # the database pointing at it, the message looks unseen to the next
+        # cycle's dedup guards, and the agent drafts for it again — once every
+        # POLL_INTERVAL_MINUTES, indefinitely. That is why the parent row goes
+        # out first here rather than relying on flush order being inferred.
+        s.flush()
 
         opp_id = None
         if opportunity is not None:

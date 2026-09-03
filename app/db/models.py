@@ -285,6 +285,33 @@ class Message(Base):
         back_populates="message", uselist=False, cascade="all, delete-orphan"
     )
 
+    # CONCEPT: a relationship() is not decoration — it is what orders INSERTs.
+    #   SQLAlchemy's unit of work builds its flush order from relationship()
+    #   dependencies between MAPPERS. A raw ForeignKey column tells the
+    #   DATABASE about the constraint but tells the ORM nothing about which
+    #   row to write first, so with no relationship the two INSERTs are
+    #   emitted in an arbitrary order.
+    # GOTCHA — this omission caused a live incident on 2026-09-02 (D78).
+    #   `Draft.message_id` had the ForeignKey and no relationship, so
+    #   persist_auto could emit INSERT INTO drafts BEFORE INSERT INTO
+    #   messages. Postgres rejected it on drafts_message_id_fkey, the whole
+    #   transaction rolled back, and because the Gmail draft had ALREADY been
+    #   created the message was left with no row at all — so every subsequent
+    #   ingest cycle saw it as brand new and drafted for it again, every 15
+    #   minutes, until someone noticed the Drafts folder filling up.
+    #   It stayed hidden for months because every other path happened to call
+    #   s.flush() for the opportunity row in between, which forced `messages`
+    #   out first by accident. The questionnaire path (D67) has no opportunity
+    #   and so no flush, and that is what exposed it.
+    # WHY this declaration and not only the flush in persist: the flush fixes
+    #   the two call sites that exist today; this fixes the ordering for every
+    #   call site that will ever exist. Both are in — see D78 for why belt and
+    #   braces was the right call for a bug whose failure mode is silent
+    #   duplicate outbound mail.
+    draft: Mapped[Draft | None] = relationship(
+        back_populates="message", uselist=False, cascade="all, delete-orphan"
+    )
+
 
 class Opportunity(Base):
     __tablename__ = "opportunities"
@@ -400,6 +427,13 @@ class Draft(Base):
     reply_to_email: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    # The other half of Message.draft. See the CONCEPT there: this pairing is
+    # what tells the unit of work to INSERT the message before the draft.
+    # GOTCHA: declaring this changes flush ORDER, not schema. No migration
+    # accompanies it — the FK constraint it describes has existed in the DB
+    # since migration 0001; only the ORM was unaware of it.
+    message: Mapped[Message] = relationship(back_populates="draft")
 
 
 class DuplicateFlag(Base):

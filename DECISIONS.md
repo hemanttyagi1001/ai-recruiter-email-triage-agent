@@ -1557,6 +1557,54 @@ Nesting can no longer route around a drop.
 scalar nested under a prose key that is genuinely wanted in a trace. Nothing
 like that exists today.
 
+## D78 — A relationship() is what orders INSERTs, not a ForeignKey (2026-09-02)
+
+**Decision:** declare the missing `Message.draft` / `Draft.message`
+relationship, AND flush the parent row explicitly in `persist_pending` and
+`persist_auto` before adding anything that references it. Belt and braces,
+deliberately.
+
+**The incident:** `Draft.message_id` had a `ForeignKey` and no
+`relationship()`. SQLAlchemy's unit of work derives flush order from
+relationships between mappers, not from raw FK columns, so it was free to emit
+`INSERT INTO drafts` before `INSERT INTO messages`. Postgres rejected it on
+`drafts_message_id_fkey` and rolled back the transaction — including the
+`messages` row, which is why the SQL log shows that INSERT never happening at
+all rather than happening in the wrong order.
+
+**Why it cost real drafts rather than just an error:** by the time
+`persist_auto` runs, `auto_send` has already created the Gmail draft. A failed
+transaction left a real draft in the mailbox with no database row pointing at
+it, so the next cycle's `gmail_id` and `message_id` dedup guards saw an unseen
+message and drafted for it again — once every POLL_INTERVAL_MINUTES,
+indefinitely. Twelve drafts for two recruiters before it was noticed, and
+deleting them in Gmail did nothing because the agent never knew they existed.
+`already_replied` could not help either: it counts AUTO_SENT only (D60), and
+there was no draft row to count.
+
+**Why it hid for months:** every path carrying an Opportunity calls `s.flush()`
+to populate `opp_row.id` for a downstream FK, and that flush forced `messages`
+out first by accident. The questionnaire path (D67) is the only route to
+`persist_auto` with `opportunity is None` — the first path with no flush, and
+it went straight to production behaviour.
+
+**Why both fixes and not one:** the relationship makes ordering correct for
+every call site that will ever exist; the explicit flush makes it correct at
+the point a reader is actually looking, instead of correct because of a
+declaration in another module. For a bug whose failure mode is silent
+duplicate outbound mail, one of each was the right price.
+
+**No migration:** this changes ORM flush order, not schema. The FK constraint
+has existed in the database since migration 0001; only the ORM was unaware.
+
+**Known and NOT fixed here:** the irreversible Gmail side effect still happens
+before the durable record is written, so ANY future failure in `persist_auto`
+reproduces this same loop from a different cause. Writing an intent row before
+calling Gmail, or moving the send after the commit, is the real repair and is
+a larger change than a hotfix should carry.
+
+**Revisit if:** the ordering issue recurs anywhere (it would mean a new mapper
+pair with a bare ForeignKey), or when the intent-row change above is taken on.
 ## D79 — Bounces are detected in code and trashed, gated three ways (2026-09-03)
 
 **Decision:** `ingest_node` recognises non-delivery reports deterministically
