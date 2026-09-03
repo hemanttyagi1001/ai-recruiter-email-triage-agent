@@ -241,6 +241,12 @@ _AUTO_REPLY_MARKERS: tuple[str, ...] = (
     "delivery status notification",
     "mail delivery failed",
     "returned mail",
+    # D79: the phrase Gmail's own web UI shows on a bounce. The Subject header
+    # is usually "Delivery Status Notification (Failure)", so this rarely fires
+    # here — but it is what a user sees and therefore what some relays put in
+    # the actual subject. Cheap to cover, and its absence was a real gap:
+    # is_auto_responder("Address not found") returned False.
+    "address not found",
 )
 
 

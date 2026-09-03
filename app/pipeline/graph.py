@@ -4,7 +4,8 @@ LangGraph wiring — Phase 2.
 Shape (Phase 5):
 
     START
-      └→ ingest → classify ─┬─ (skip) ─→ persist_terminal → END
+      └→ ingest ─┬─ (bounce, D79) ─→ persist_terminal → inbox_cleanup → END
+                 └→ classify ─┬─ (skip) ─→ persist_terminal → END
                             └─ (extract) → extract ─┬─ (failed) → persist_terminal → END
                                                     └─ (ok) → embed_jd → dedup_check → rules
                                                                                           │
@@ -79,7 +80,12 @@ import logging
 
 from app.candidate import CandidateProfile
 from app.config import settings
-from app.db.models import EXTRACTABLE_CATEGORIES, Category, DraftType
+from app.db.models import (
+    EXTRACTABLE_CATEGORIES,
+    Category,
+    DraftType,
+    MessageStatus,
+)
 from app.dedup.nodes import make_dedup_check_node, make_embed_jd_node
 from app.drafts.generator import (
     DEFAULT_FACT_LABELS,
@@ -96,6 +102,7 @@ from app.llm.client import LLMClient
 from app.pipeline.act import make_act_node
 from app.pipeline.auto_send_node import make_auto_send_node
 from app.pipeline.classify import classify
+from app.pipeline.cleanup_node import make_inbox_cleanup_node
 from app.pipeline.extract import extract
 from app.pipeline.ingest_node import ingest_node
 from app.pipeline.persist import (
@@ -566,6 +573,26 @@ def _route_after_validate(state: TriageState) -> str:
     return "auto_send"
 
 
+def _route_after_persist_terminal(state: TriageState) -> str:
+    """D79 — the only edge in this graph that leads to mail being removed.
+
+    TRACE: every skipped message passes through persist_terminal — wrong
+    category, no reply target, already replied, extraction failed, and
+    non-delivery reports. Only the last of those may be trashed, so the branch
+    is on the status ingest set, and the cleanup node re-checks it rather than
+    trusting this router. Two independent checks for an irreversible action is
+    the same belt-and-braces reasoning as D78.
+
+    WHY the cleanup runs AFTER persist rather than inside ingest, where the
+    bounce was detected: the messages row must exist before the mailbox is
+    mutated. If the trash call succeeded and the write then failed, the
+    evidence of what was deleted would be gone along with the mail.
+    """
+    if state.get("final_status") == MessageStatus.SKIPPED_UNDELIVERABLE:
+        return "inbox_cleanup"
+    return END
+
+
 def _route_after_act(state: TriageState) -> str:
     # TRACE: act may have been halted by the kill switch. On halt the
     # message must stay awaiting_approval — persist_final knows how to
@@ -619,6 +646,9 @@ def build_graph(
     # Phase 5 — autonomy path nodes.
     g.add_node("auto_send", make_auto_send_node(gmail))
     g.add_node("persist_auto", persist_auto)
+    # D79 — inbox cleanup. Reached only from persist_terminal, and only for
+    # non-delivery reports.
+    g.add_node("inbox_cleanup", make_inbox_cleanup_node(gmail))
 
     # Edges
     g.add_edge(START, "ingest")
@@ -669,7 +699,14 @@ def build_graph(
         {"persist_final": "persist_final"},
     )
     g.add_edge("persist_final", END)
-    g.add_edge("persist_terminal", END)
+    # D79: persist_terminal used to end the run unconditionally. It now forks —
+    # a non-delivery report continues to inbox_cleanup, everything else still
+    # ends here. The row is already written by the time either branch is taken.
+    g.add_conditional_edges(
+        "persist_terminal", _route_after_persist_terminal,
+        {"inbox_cleanup": "inbox_cleanup", END: END},
+    )
+    g.add_edge("inbox_cleanup", END)
 
     # CONCEPT: `interrupt_before=["act"]` at compile time means LangGraph
     # writes a checkpoint after `persist_pending` and returns from

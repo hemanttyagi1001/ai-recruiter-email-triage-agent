@@ -124,6 +124,31 @@ class Settings(BaseSettings):
     # that makes "300" mean five hours instead of five minutes is a footgun.
     poll_interval_minutes: int = Field(default=15, gt=0)
 
+    # --- Inbox cleanup (D79) ---
+    # CONCEPT: the agent receives bounces for the mail it sends, and they pile
+    #   up in the same INBOX it reads. This decides what happens to them.
+    #     off     — detect and record, touch nothing. Bounces still stop before
+    #               classify, so the token saving applies in every mode.
+    #     dry_run — log exactly which message WOULD be trashed, call no Gmail
+    #               mutation. The observation setting.
+    #     trash   — move it to Gmail's Trash, where Gmail purges it after 30
+    #               days. Recoverable until then.
+    # WHY there is no `delete` value: permanent deletion needs the
+    #   `https://mail.google.com/` scope, which this token deliberately does
+    #   not hold (see SCOPES in app/gmail/client.py). The narrow scopes are the
+    #   safety property; adding a value the token cannot satisfy would turn a
+    #   design decision into a 403 at runtime.
+    # WHY the default is `off` even though the operator runs this armed: this
+    #   repository is public. A default that silently trashes mail for anyone
+    #   who clones it is a hazard the operator did not intend to ship to
+    #   strangers. Arming is one line in .env, which is where a decision about
+    #   a specific mailbox belongs.
+    # GOTCHA: gated by the kill switch as well as by this setting. D49 exempts
+    #   draft-mode from the switch on the argument that a draft is not outbound
+    #   mail; trashing is MORE consequential than sending, not less, so the
+    #   exemption does not extend here. See D79.
+    inbox_cleanup_mode: Literal["off", "dry_run", "trash"] = Field(default="off")
+
     # Typeface for the HTML part of outbound mail.
     # WHY here and not in candidate.toml alongside the signature: this is
     # presentation, not profile, and app/gmail/client.py already imports

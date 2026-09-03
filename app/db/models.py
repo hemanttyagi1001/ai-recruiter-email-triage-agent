@@ -78,6 +78,16 @@ class MessageStatus(StrEnum):
     # and drafting, so a recruiter who mails five times costs one reply and
     # four cheap classify+extract passes. See D60.
     SKIPPED_ALREADY_REPLIED = "skipped_already_replied"
+    # A non-delivery report — a mail server telling us something we sent never
+    # arrived. Detected deterministically at ingest, BEFORE classify, so a
+    # bounce costs no tokens at all. Distinct from SKIPPED_WRONG_CATEGORY,
+    # where the classifier reached the same conclusion but only after paying
+    # for it: keeping them apart is what makes "how much of my inbox is my own
+    # failed outbound" a query instead of a guess, and it is also the status
+    # the inbox_cleanup node keys on to decide what to trash. See D79.
+    # WHY no migration: status is a TEXT column with a Python StrEnum (D10)
+    # precisely so adding a state stays a code-only change.
+    SKIPPED_UNDELIVERABLE = "skipped_undeliverable"
     # Phase 1 additions.
     DRAFTED = "drafted"
     NEEDS_REVIEW = "needs_review"
