@@ -3,6 +3,69 @@
 One entry per decision. Short: what we chose, what we considered, why, and
 what would make us revisit. Newest at the bottom.
 
+**This log is append-only.** Entries are never edited to match current
+behaviour and never deleted when reversed — a decision that was later undone
+is the most useful kind, because it records reasoning that looked right and
+was not. When a decision is overturned, the new entry says so and a
+`SUPERSEDED BY` line is added to the old one. Nothing above is rewritten.
+
+---
+
+## Current flow — which decisions are actually in force
+
+Read this section to understand the system as it stands today; read the
+numbered entries to understand why. Stages are in execution order.
+
+| Stage | In force today | Superseded history |
+|---|---|---|
+| Fetch + idempotency | D2, D18, D8 | — |
+| Gmail scopes | **D69** (required + optional split) | D19 → D40 → D69 |
+| Bounce detection + trash | **D79** | — |
+| Classify | D3, D13, **D76** (states a reason first) | — |
+| Follow-ups | **D67** (screening forms answered) | D55 (none answered) → D67 |
+| Extract | D3, D9, D44, D46 | — |
+| Reply target | **D59** (Naukri relay decoded) | D47 → D59 |
+| One reply per recruiter | **D60** | — |
+| Dedup | D23–D30 (flags are metadata, never suppression) | — |
+| Rules | D11, D16, **D65** (C2H configurable) | — |
+| Fit scoring | **D80** (abstention → interested + human gate) | D15 → *D54* → D66 → D80 |
+| Drafting | **D58** (LLM bodies may send), D61, **D64** (pivot), D66, D68 | D12 → D56 → D58 |
+| CV attachment | **D64** + D61 (on request, or with a pivot) | D57 (always) → D61 |
+| Outbound validation | D14 — never negotiable by config | — |
+| Autonomy | **D73** (draft-only) | D33 → D45 → D49 → D73 |
+| Kill switch | D36; gates sends and **D79** cleanup, not drafts (D49) | — |
+| Persist | D21, **D78** (INSERT ordering) | — |
+| Retry / resilience | D35, D42, D43, D70, D71, D72 | — |
+| Observability | D74 (activity log), **D75** + D77 (tracing) | D63 → D75 |
+
+**Two gates cannot be turned off by configuration**, and it is worth knowing
+which: the outbound validator's quarantine verdict (D14) and `requires_human`
+(D80). Everything else in the autonomy path is operator-configurable.
+
+## Superseded — do not implement from these
+
+- **D12, D56** — drafting. Current: **D58**.
+- **D15, D66** — what an uncertain fit score does. Current: **D80**.
+- **D19, D40** — Gmail scopes. Current: **D69**.
+- **D33, D45, D49** — autonomy criterion. Current: **D73**.
+- **D47** — reply target for relays. Current: **D59**.
+- **D55** — follow-up handling. Current: **D67**.
+- **D57** — CV attachment. Current: **D61** + **D64**.
+- **D63** — what tracing uploads. Current: **D75** + **D77**.
+
+## Gaps in the numbering
+
+**D31, D32, D51, D52, D53 and D54 have no entry.** Five are unreferenced and
+are simply skipped numbers. **D54 is not** — it is cited nine times across the
+code as the reason abstention drafted an INTERESTED reply, and a reader
+following one of those comments finds nothing here. The decision it names was
+real and was later reversed twice (D66, then D80), so its reasoning is
+recoverable only from the entries that overturned it. Treat `See D54` in a
+comment as pointing at **D80**, which states what that branch does now and why
+the two earlier answers were wrong. Do not reuse these numbers.
+
+---
+
 ## D1 — LangGraph for the Phase 0 pipeline (2026-08-19)
 **Decision:** Model classify → extract → persist as a LangGraph `StateGraph`
 even though a plain function chain would work at this size.
@@ -118,6 +181,8 @@ authorisation" without keyword matches) — then an LLM check that *feeds*
 a code rule, not one that replaces it.
 
 ## D12 — Drafts are template-only, no LLM in drafting (2026-08-19)
+
+> **SUPERSEDED BY D56, then D58.** Drafts are no longer template-only; an LLM may write the body and it may be sent.
 **Decision:** Reply drafts come from `str.format` on committed templates
 (`app/drafts/templates/*.txt`). No LLM call in the drafting path.
 **Alternatives:** LLM-generated drafts, gated by the outbound validator.
@@ -167,6 +232,8 @@ sanitised message that looks fine and got sent.
 consider a dedicated PII library (presidio) rather than more ad-hoc regex.
 
 ## D15 — Fit threshold 65; uncertain → NEEDS_REVIEW, score ignored (2026-08-19)
+
+> **SUPERSEDED BY D66, then D80.** An uncertain score no longer routes to NEEDS_REVIEW. It drafts an INTERESTED reply behind a mandatory human gate.
 **Decision:** Fit threshold defaults to 65 (in `candidate.toml [scoring]`).
 `uncertain=true` from the scorer routes to `NEEDS_REVIEW` with no draft
 generated, regardless of the score value. Score < threshold generates a
@@ -232,6 +299,8 @@ because Postgres serialises checkpoint writes per thread_id.
 D2's revisit condition — same fallback).
 
 ## D19 — Gmail scope escalation to gmail.compose (2026-08-19)
+
+> **SUPERSEDED BY D40, then D69.** Scopes are now readonly + compose as required, modify as optional.
 **Decision:** Phase 2 upgrades the OAuth scope from `gmail.readonly` to
 `gmail.compose`. Gmail has no drafts-only scope; `compose` also grants
 send permission. Our "drafts-only" guarantee is a CODE property:
@@ -506,6 +575,8 @@ markedly different (< 0.7 or > 0.95), or the review UI can gracefully
 display more than 5 flags per message (e.g. as a collapsible list).
 
 ## D33 — Autonomy criterion: blast radius × reversibility, not model confidence (2026-08-20)
+
+> **SUPERSEDED BY D45, then D73.** The five gates were removed; autonomy is now draft-only.
 **Decision:** The agent is permitted to auto-send exactly one class of
 message: a rule-fired decline where the fit scorer did not run, the
 draft was not quarantined, and no duplicate flags were raised. Every
@@ -666,6 +737,8 @@ alone is $0.000147/msg against the README's $0.000044 estimate, ~3.3x.
 per-run cost exceeds roughly $0.50 per 100 messages.
 
 ## D40 — Gmail scopes are readonly + compose, superseding D19 (2026-08-21)
+
+> **SUPERSEDED BY D69.** The list is now split into required and optional scopes.
 **Decision:** `SCOPES = [gmail.readonly, gmail.compose]`. D19's claim that
 Phase 2 "upgrades the scope from readonly to compose" was wrong: Gmail
 scopes are disjoint capability sets, not a ladder. `compose` grants
@@ -762,6 +835,8 @@ mis-decoded UTF-16 are the likely next one), which would argue for a general
 "encode-safe for PG text" pass rather than a NUL special case.
 
 ## D45 — Full autonomy: AUTO_SEND_MODE, and the four D33 gates removed (2026-08-21)
+
+> **SUPERSEDED BY D73.** Full autonomy was reverted to draft-only.
 **Decision:** `AUTO_SEND_MODE` = `off` | `dry_run` | `on`, defaulting to
 `dry_run`. When armed, BOTH declines and interested replies send with no human
 approval. D33's gates 1, 2, 4 and 5 (rule-fired only, decline-only, no fit
@@ -801,6 +876,8 @@ any interested draft containing NA, making it a code rule rather than a
 warning nobody read.
 
 ## D47 — Reply target resolved deterministically; portal alerts never answered (2026-08-21)
+
+> **SUPERSEDED BY D59.** Relay addresses are decoded rather than skipped.
 **Decision:** `app/rules/reply_target.resolve_reply_target` picks the address
 a reply goes to, preferring the extracted `Opportunity.recruiter_email` over
 `parsed.from_email`, and returning None when neither reaches a human. None
@@ -845,6 +922,8 @@ the signature needs per-recruiter variation — at which point it stops being
 config and becomes a template concern.
 
 ## D49 — AUTO_SEND_MODE gains `draft`: autonomous drafting, manual send (2026-08-21)
+
+> **SUPERSEDED BY D73**, which made `draft` the ceiling rather than one mode among four.
 **Decision:** Fourth mode `draft`. The agent runs the full autonomous path and
 calls `drafts.create` instead of `messages.send`, with no approval step. The
 reply lands in Gmail Drafts; a human presses send. Recorded as
@@ -892,6 +971,8 @@ which is a point in favour of writing that kind of comment.
 Draft-row construction should be extracted into one function.
 
 ## D55 — followup_existing_thread no longer drafts (2026-08-22)
+
+> **SUPERSEDED BY D67.** Screening forms in follow-up threads are answered.
 **Decision:** `EXTRACTABLE_CATEGORIES` drops `FOLLOWUP_EXISTING_THREAD`. Those
 messages are still classified, extracted and stored; they stop before drafting.
 **Alternatives:** Deterministic rejection-phrase detection while keeping
@@ -912,6 +993,8 @@ feed prior turns to the drafter). Without that, re-enabling this reintroduces
 the same failure whether the drafter is a template or an LLM.
 
 ## D56 — LLM-written reply bodies, which may never be auto-sent (2026-08-22)
+
+> **SUPERSEDED BY D58**, which reversed it: LLM-written bodies may now be sent.
 **Decision:** `DRAFT_MODE=template|llm`. In `llm` mode a tool-free
 `structured_completion` writes the INTERESTED body; declines stay on templates.
 A new `draft_source` field records which drafter ran, and `auto_send` refuses
@@ -941,6 +1024,8 @@ change and a materially different risk posture — it would mean text shaped by
 a stranger's email leaving the mailbox unread, under the user's name.
 
 ## D57 — The CV is attached to every reply (2026-08-22)
+
+> **SUPERSEDED BY D61, then D64.** The CV is attached on request, or alongside a pivot.
 **Decision:** `_resume_attachment` no longer consults `resume_requested`. Every
 outbound reply carries the CV. The flag is still computed and still selects the
 wording ("attached as requested" vs a passing mention).
@@ -1081,6 +1166,8 @@ dead-letter on repeated cycle failure), which would have caught this in
 minutes rather than days.
 
 ## D63 — LangSmith tracing, with redaction in code and free text dropped (2026-08-26)
+
+> **SUPERSEDED BY D75** (identifiers releasable behind a flag) and **D77** (free-text drops its whole subtree).
 **Decision:** Tracing is opt-in via `LANGSMITH_TRACING` and off by default.
 When on, both trace sources — the LangGraph node tracer and the `wrap_openai`
 wrapper around the Azure SDK — are handed the SAME `Client`, whose anonymizer
@@ -1176,6 +1263,8 @@ first rule in the list and was shadowing the money check for these.
 argues for a separate (higher) floor for C2H rather than re-arming the rule.
 
 ## D66 — Score alone routes the reply; code owns the facts block (2026-08-26)
+
+> **SUPERSEDED BY D80.** Routing on the score alone made an abstention indistinguishable from a confident zero, which produced a PIVOT on roles that matched.
 **Decision:** Two changes to the reply path. (1) The score node no longer
 special-cases `uncertain` — it routes on `score >= fit_threshold` alone, so an
 uncertain low score now PIVOTs. (2) The candidate's standing facts (total and
@@ -1666,3 +1755,61 @@ same detector rather than reimplementing it, so the two cannot drift.
 phrase), or if a false positive is ever observed — in which case the sender
 check should tighten before the subject check, since the subject is the half
 attacker-controlled by whoever chose the original subject line.
+
+## D80 — An abstention is not a score; it drafts interested behind a human gate (2026-09-04)
+
+**Decision:** `FitScore.uncertain=True` now sets `draft_type=INTERESTED` and
+`requires_human=True`. The reply is drafted and always queued for approval,
+whatever AUTO_SEND_MODE says. The numeric score is not compared to the
+threshold on that path. Separately, the scorer prompt no longer treats a
+missing CTC as grounds to abstain, and no longer scores compensation at all.
+
+**The incident:** a Naukri alert for an "Artificial Intelligence Engineer"
+role — Hyderabad, remote, RAG/LLM/NLP, squarely on-profile — received a PIVOT
+saying "This particular role isn't the direction I'm heading — I've moved
+fully into AI/ML". The scorer's own stored rationale on the same row read:
+"The role strongly aligns with the candidate's GenAI/RAG/LLM experience and
+remote work preference, but the job posting provides no compensation range."
+It scored 0 with uncertain=true. 6 of 16 pivots were this, including an AI
+Research Engineer and a Remote Machine Learning Engineer.
+
+**Root cause, in the prompt:** it read "Set this whenever a critical field
+(role, stack, **CTC**) is missing". Job boards publish "Not Disclosed" as a
+matter of routine, so an entire inbound channel abstained by construction. The
+model did exactly what it was told; nothing about its capability was at fault.
+
+**Root cause, in the routing:** abstention returns score 0, and D66 removed
+the only branch that read `uncertain`. So 0 was compared against the threshold
+of 65 like any other number, and PIVOT — which asserts a REASON — was applied
+to a role about which no reason had been established.
+
+**Compensation is no longer scored, at all.** The CTC floor is a
+deterministic rule that already ran before this node; anything reaching the
+scorer has passed it. Asking a model to re-weigh it duplicates a code rule
+(D11) and duplicates it worse — the rule compares a number, the model has to
+interpret an absent one. New weights: role/stack 45%, seniority 25%,
+location/work model 20%, employment type 10%.
+
+**Why INTERESTED and not silence:** the abstention establishes nothing against
+the role, and a recruiter who wrote a real pitch deserves an answer. D54 also
+drafted interested on abstention; what it lacked was the gate. The safety here
+comes from `requires_human`, not from refusing to reply.
+
+**Why this is the third answer to the same question:** D15 sent abstention to
+NEEDS_REVIEW, D54 sent it to INTERESTED and auto-sent it, D66 removed the
+branch so it fell through to PIVOT. Each rewiring was one line in a router and
+each changed what real recruiters received. The lesson is not about which
+branch is right — it is that a signal read by exactly one `if` in one router,
+with no test pinning it, will be rewired by whoever next touches that router.
+`tests/test_abstention_routing.py` exists so the fourth rewiring has to be
+deliberate.
+
+**Known effect the operator accepted:** roles with undisclosed pay will now
+score on their merits and more will clear the threshold, so more interested
+replies will go out. The CTC floor still protects the downside, but only when
+a number is actually present.
+
+**Revisit if:** abstentions become common again (that would mean postings are
+genuinely unscoreable, not that the prompt is wrong), or if the approval queue
+fills with abstentions the operator always approves — which would argue the
+gate has become ceremony.

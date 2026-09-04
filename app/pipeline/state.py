@@ -202,6 +202,19 @@ class TriageState(TypedDict, total=False):
     # internal representation.
     needs_review: bool
 
+    # D80: this thread must be seen by a human before anything is sent, no
+    # matter what AUTO_SEND_MODE says. Set when the fit scorer ABSTAINED —
+    # a reply is still drafted, but a draft written on the strength of a
+    # score the model told us to ignore is not one to send unsupervised.
+    # WHY a general flag rather than re-reading fit_score_result.uncertain in
+    # the router: "must not auto-send" is a property of the THREAD, and the
+    # next reason to set it will not be the fit scorer. Routing on the flag
+    # means that next reason costs one line here and none in the router.
+    # GOTCHA: this is the second gate in _route_after_validate that survives
+    # AUTO_SEND_MODE, alongside the outbound validator's quarantine verdict.
+    # Both mean "not without a human", and neither is negotiable by config.
+    requires_human: bool
+
     # -------------------------------------------------------------------------
     # Embedding — populated by embed_jd (Phase 4).
     # -------------------------------------------------------------------------
