@@ -242,6 +242,78 @@ def trace_tags() -> list[str]:
     ]
 
 
+# -----------------------------------------------------------------------------
+# One library warning, silenced on purpose
+# -----------------------------------------------------------------------------
+
+_warning_filtered = False
+
+# CONCEPT: why suppressing a third-party warning is defensible HERE and is
+#   usually not. A warning filter is a promise that you have understood the
+#   warning and that it cannot become a real signal. That promise is only
+#   keepable when the filter is narrow enough to match one known artefact and
+#   nothing else — which is why this matches the message text AND the
+#   `field_name='parsed'` detail, rather than silencing UserWarning, or
+#   pydantic, or "serializer warnings" as a class. Any OTHER Pydantic
+#   serialization warning, including one about our own models, still surfaces.
+#
+# WHAT it silences, traced end to end on 2026-09-04:
+#   app/llm/client.py structured_completion
+#     -> langsmith/wrappers/_openai.py:336 parse        (the wrap_openai shim)
+#       -> langsmith/run_helpers.py:1729 _handle_container_end
+#         -> langsmith/wrappers/_openai.py:263 _process_chat_completion
+#           -> pydantic/main.py model_dump()            <- warning issued here
+#
+#   `beta.chat.completions.parse()` returns a ParsedChatCompletion whose
+#   `message.parsed` field is GENERIC — it holds our ClassificationResult,
+#   FitScore or Opportunity. LangSmith dumps that response to build the trace
+#   payload, and at dump time the generic resolves to NoneType, so Pydantic
+#   reports finding a model where it expected None. The data is dumped
+#   correctly; only the declared type is wrong.
+#
+# GOTCHA — the reason it looked frightening and was not: our own TriageState
+#   also has a field called `parsed` (the ParsedMessage). The names collide by
+#   pure coincidence, and the warning has nothing to do with our state, our
+#   checkpoints, or our database. Verified by experiment, not by reading:
+#   LANGSMITH_TRACING=false produces zero of these, true produces one per
+#   structured call, same code path otherwise.
+#
+# WHY silence it at all rather than live with it: it fires once per structured
+#   LLM call — three per message — so a 200-message cycle buries the log in
+#   them. That is not cosmetic. The D78 foreign-key violations went unnoticed
+#   for four cycles precisely because real errors were lost in routine noise.
+#
+# Upstream: reported to the langsmith SDK; remove this filter when a release
+# fixes _process_chat_completion to dump the parameterised model.
+_PARSED_GENERIC_WARNING = (
+    r"Pydantic serializer warnings:[\s\S]*field_name='parsed'"
+)
+
+
+def silence_parsed_completion_warning() -> None:
+    """Filter the one Pydantic warning wrap_openai provokes. Idempotent.
+
+    TRACE: called from wrap_llm_client below, and therefore installed if and
+    only if wrap_openai was actually applied — the exact condition under which
+    the warning can occur. An untraced process installs no filters at all.
+    """
+    global _warning_filtered
+    if _warning_filtered:
+        return
+    import warnings
+
+    warnings.filterwarnings(
+        "ignore",
+        message=_PARSED_GENERIC_WARNING,
+        category=UserWarning,
+    )
+    _warning_filtered = True
+    log.debug(
+        "filtered the ParsedChatCompletion serializer warning raised by "
+        "langsmith's wrap_openai; see app/observability/tracing.py"
+    )
+
+
 def wrap_llm_client(azure_client: Any) -> Any:
     """Wrap the Azure SDK client for tracing, or hand it straight back.
 
@@ -259,6 +331,10 @@ def wrap_llm_client(azure_client: Any) -> Any:
         return azure_client
 
     from langsmith.wrappers import wrap_openai
+
+    # Installed here, next to the thing that causes it, so the two can never
+    # drift apart: no wrap_openai, no filter.
+    silence_parsed_completion_warning()
 
     try:
         return wrap_openai(azure_client, tracing_extra={"client": client})
