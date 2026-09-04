@@ -88,6 +88,18 @@ class MessageStatus(StrEnum):
     # WHY no migration: status is a TEXT column with a Python StrEnum (D10)
     # precisely so adding a state stays a code-only change.
     SKIPPED_UNDELIVERABLE = "skipped_undeliverable"
+    # The last message in this Gmail thread was one WE sent, so the
+    # conversation is already answered — usually by the operator replying by
+    # hand, which leaves no trace in this database at all.
+    # WHY distinct from SKIPPED_ALREADY_REPLIED: that one is D60, keyed on the
+    # recruiter's ADDRESS and answered from the drafts table — "have we ever
+    # written to this person". This one is keyed on the THREAD and answered
+    # from Gmail — "has this particular conversation been answered". They
+    # disagree constantly, and collapsing them would hide how much inbound the
+    # operator is handling manually behind how much the agent deduped. See D81.
+    # WHY no migration: status is a TEXT column with a Python StrEnum (D10)
+    # precisely so adding a state stays a code-only change.
+    SKIPPED_THREAD_ANSWERED = "skipped_thread_answered"
     # Phase 1 additions.
     DRAFTED = "drafted"
     NEEDS_REVIEW = "needs_review"

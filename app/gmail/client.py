@@ -490,6 +490,36 @@ class GmailClient:
     def profile(self) -> dict:
         return self.service.users().getProfile(userId="me").execute()
 
+    @retry_external(node="gmail_thread")
+    def thread_messages(self, thread_id: str) -> list[dict]:
+        """Every message in a thread, labels and dates only.
+
+        CONCEPT: format="minimal" is doing real work here. It returns ids,
+        labelIds and internalDate and NOTHING else — no headers, no body, no
+        attachments. That matters twice over: it keeps the response small
+        enough to run on every new message, and it means this call cannot
+        bring recruiter prose into a code path that has no business holding
+        any. The caller only needs to know who spoke last.
+
+        TRACE: one call per new message, from ingest_node, before classify.
+        Read-only, so it needs nothing beyond the gmail.readonly scope the
+        pipeline already requires.
+
+        GOTCHA: retried rather than swallowed, unlike mark_read and
+        trash_message. Those two run AFTER the outcome that matters and must
+        never fail a run; this one runs BEFORE a decision and its answer
+        changes what the recruiter receives, so a transient failure deserves
+        the retry policy. The caller in app/rules/thread_replied.py is what
+        turns final exhaustion into "assume not answered".
+        """
+        thread = (
+            self.service.users()
+            .threads()
+            .get(userId="me", id=thread_id, format="minimal")
+            .execute()
+        )
+        return thread.get("messages", [])
+
     def mark_read(self, gmail_id: str) -> bool:
         """Remove the UNREAD label from a message. True if Gmail confirmed it.
 

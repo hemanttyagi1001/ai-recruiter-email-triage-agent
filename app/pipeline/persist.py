@@ -50,6 +50,19 @@ from app.db.models import (
 from app.pipeline.state import TriageState, make_event
 
 
+# Terminal statuses that `ingest` is entitled to decide on its own, before any
+# category or opportunity exists. persist_terminal honours these verbatim
+# instead of deriving a status from state that was never populated.
+# GOTCHA: this set must stay SMALL and explicit. The duplicate path also
+# arrives at persist_terminal carrying a final_status — the EXISTING row's
+# status — and that one must not overwrite a fresh derivation. Listing only
+# the values ingest decides keeps the two cases apart.
+_INGEST_DECIDED_STATUSES = frozenset({
+    MessageStatus.SKIPPED_UNDELIVERABLE,    # D79 — a bounce
+    MessageStatus.SKIPPED_THREAD_ANSWERED,  # D81 — we spoke last
+})
+
+
 # =============================================================================
 # persist_pending — runs after validate, before the interrupt
 # =============================================================================
@@ -302,9 +315,12 @@ def persist_terminal(state: TriageState) -> dict:
     # final_status (the EXISTING row's status), and that one must NOT overwrite
     # what the derivation produces for a fresh row. Narrowing to the single
     # value ingest is entitled to decide keeps the two cases apart.
+    # D81 joins D79 here for the same reason: both are decided by ingest from
+    # facts that have nothing to do with category, opportunity or reply target,
+    # so _terminal_status has nothing to reason about and would derive FETCHED.
     preset = state.get("final_status")
-    if preset == MessageStatus.SKIPPED_UNDELIVERABLE:
-        final_status = MessageStatus.SKIPPED_UNDELIVERABLE
+    if preset in _INGEST_DECIDED_STATUSES:
+        final_status = preset
     else:
         final_status = _terminal_status(
             category=category,
