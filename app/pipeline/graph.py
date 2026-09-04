@@ -4,7 +4,8 @@ LangGraph wiring — Phase 2.
 Shape (Phase 5):
 
     START
-      └→ ingest ─┬─ (bounce, D79) ─→ persist_terminal → inbox_cleanup → END
+      └→ ingest ─┬─ (bounce, D79)          → persist_terminal → inbox_cleanup → END
+                 ├─ (we spoke last, D81)   → persist_terminal → END
                  └→ classify ─┬─ (skip) ─→ persist_terminal → END
                             └─ (extract) → extract ─┬─ (failed) → persist_terminal → END
                                                     └─ (ok) → embed_jd → dedup_check → rules
@@ -104,7 +105,7 @@ from app.pipeline.auto_send_node import make_auto_send_node
 from app.pipeline.classify import classify
 from app.pipeline.cleanup_node import make_inbox_cleanup_node
 from app.pipeline.extract import extract
-from app.pipeline.ingest_node import ingest_node
+from app.pipeline.ingest_node import make_ingest_node
 from app.pipeline.persist import (
     persist_auto,
     persist_final,
@@ -670,7 +671,8 @@ def build_graph(
     g: StateGraph = StateGraph(TriageState)
 
     # Nodes
-    g.add_node("ingest", ingest_node)
+    # D81: the ingest node needs Gmail to ask who spoke last in the thread.
+    g.add_node("ingest", make_ingest_node(gmail))
     g.add_node("classify", _make_classify_node(llm))
     g.add_node("extract", _make_extract_node(llm))
     g.add_node("embed_jd", make_embed_jd_node(llm, profile))

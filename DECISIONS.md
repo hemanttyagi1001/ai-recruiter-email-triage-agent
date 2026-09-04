@@ -21,11 +21,12 @@ numbered entries to understand why. Stages are in execution order.
 | Fetch + idempotency | D2, D18, D8 | — |
 | Gmail scopes | **D69** (required + optional split) | D19 → D40 → D69 |
 | Bounce detection + trash | **D79** | — |
+| Thread already answered | **D81** (we spoke last → no draft) | — |
 | Classify | D3, D13, **D76** (states a reason first) | — |
 | Follow-ups | **D67** (screening forms answered) | D55 (none answered) → D67 |
 | Extract | D3, D9, D44, D46 | — |
 | Reply target | **D59** (Naukri relay decoded) | D47 → D59 |
-| One reply per recruiter | **D60** | — |
+| One reply per recruiter | **D60** (per address) + **D81** (per thread) | — |
 | Dedup | D23–D30 (flags are metadata, never suppression) | — |
 | Rules | D11, D16, **D65** (C2H configurable) | — |
 | Fit scoring | **D80** (abstention → interested + human gate) | D15 → *D54* → D66 → D80 |
@@ -1813,3 +1814,62 @@ a number is actually present.
 genuinely unscoreable, not that the prompt is wrong), or if the approval queue
 fills with abstentions the operator always approves — which would argue the
 gate has become ceremony.
+
+## D81 — If we spoke last in the thread, the agent stays quiet (2026-09-04)
+
+**Decision:** `ingest_node` asks Gmail who sent the last message in the thread.
+If it was us, the message terminates as `SKIPPED_THREAD_ANSWERED` before
+classify. If it was the recruiter, the pipeline runs normally.
+
+**The rule, in the operator's words:** "if HR is sending email and last email
+from that HR not ur then only create a draft, but if last is the reply email to
+HR then no draft will be created."
+
+**Why it was needed:** nothing in this database knows a human replied. D60's
+`already_replied` answers from the `drafts` table, which records only what the
+AGENT did — so a reply typed in Gmail is invisible and the agent drafts on top
+of a conversation that has already happened. Measured on the live mailbox: **11
+of 12 threads carrying an agent draft already contained a sent reply.**
+
+**A worse finding underneath it:** D60 counts only `DraftStatus.AUTO_SENT` as
+delivered. Under `AUTO_SEND_MODE=draft` nothing is ever auto_sent — every draft
+ends `sent_to_gmail_drafts` — so the "one reply per recruiter" guard **never
+fires in the current operating mode**. It has three historical hits, all from
+when the mode was `on`. D81 does the work D60 was supposed to do, from a source
+that cannot go stale. D60 is deliberately left unchanged: it remains a
+per-ADDRESS guard over genuinely sent mail, and the operator chose the
+per-THREAD rule instead of widening it.
+
+**Why "last message" and not "any reply newer than this one":** the two agree
+in every ordinary case, and the operator's phrasing is the one a person can
+hold in their head. It also handles a running conversation with no special
+case — HR writes, we answer, HR writes again: the last message is theirs, so
+their follow-up is answered.
+
+**Why the SENT label rather than matching the From address:** the label is a
+fact Gmail stamps about provenance. Matching From against our own address would
+have to survive aliases, plus-addressing, display-name formats and send-as
+addresses, each a way to get "did I write this" wrong. A label cannot be
+spoofed by a sender.
+
+**GOTCHA that would have disabled the feature:** drafts appear in threads as
+messages. The agent's own unsent draft is the newest message in the thread, so
+counting it would make a pending draft suppress the very reply it is waiting to
+become. DRAFT-labelled messages are excluded before the last one is chosen, and
+that case is pinned by a test.
+
+**Placement, and the cost argument:** at ingest, before classify, ordered after
+the two free checks (duplicate, then bounce). It costs one metadata-only Gmail
+read and saves two LLM calls, and on this mailbox the answered case is the
+common one rather than the exception. `format="minimal"` also means the call
+returns no headers and no bodies, so a code path that only needs to know who
+spoke last never holds recruiter prose.
+
+**Fails open,** like D60 and unlike the redactor: a Gmail error assumes NOT
+answered and drafts anyway. Failing closed would silently drop every message
+during an outage, with no reply and no draft — losing real opportunities with
+nothing to show for it. A stray draft is one click to delete.
+
+**Revisit if:** the operator starts using Gmail drafts as a staging area they
+edit over days (an unsent draft would then be meaningful state this rule
+ignores), or if send-as aliases make the SENT label ambiguous.
