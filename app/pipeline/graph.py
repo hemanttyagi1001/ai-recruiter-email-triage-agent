@@ -303,7 +303,30 @@ def _make_score_node(llm: LLMClient, profile: CandidateProfile):
         # GOTCHA: an uncertain score of 0 now pivots, which is also the safer
         # reply — it states the AI/ML focus and attaches the CV rather than
         # claiming interest in a role nobody could assess.
-        if result.score >= threshold:
+        # D80: an abstention is not a score, and must not be compared to a
+        # threshold. `uncertain=True` means the model is telling us the number
+        # it just returned carries no information — and since it returns 0 when
+        # it abstains, comparing anyway reads as "worst possible fit" and lands
+        # on PIVOT. That produced a reply telling an AI/ML recruiter their
+        # Artificial Intelligence Engineer role was "not the direction I'm
+        # heading", while the scorer's own rationale said the role "strongly
+        # aligns". Six of sixteen pivots were this.
+        # WHY INTERESTED rather than terminating: the abstention says nothing
+        # is known against the role, and a recruiter who wrote a real pitch
+        # deserves an answer. The safety comes from requires_human, not from
+        # silence — D54 drafted interested on abstention too, but auto-sent it,
+        # which is the part that was wrong.
+        # TRACE: requires_human is read by _route_after_validate, which sends
+        # this thread to persist_pending and the approval queue no matter what
+        # AUTO_SEND_MODE is set to.
+        if result.uncertain:
+            updates["draft_type"] = DraftType.INTERESTED
+            updates["requires_human"] = True
+            updates["events"] = [make_event(
+                "score", outcome=f"abstained (score {result.score} ignored) → "
+                                 f"interested, human approval required",
+            )]
+        elif result.score >= threshold:
             updates["draft_type"] = DraftType.INTERESTED
             updates["events"] = [make_event("score", outcome=f"{result.score} → interested")]
         else:
@@ -542,6 +565,10 @@ def _route_after_validate(state: TriageState) -> str:
     (draft was quarantined, a duplicate was flagged, the fit scorer
     ran) drops the thread into human review. Autonomy is granted by
     intersection, not by any single strong signal.
+
+    Two gates survive AUTO_SEND_MODE and cannot be turned off by config:
+    the outbound validator's quarantine verdict (D14) and `requires_human`
+    (D80). Everything else here is the operator's judgement to configure.
     """
     draft_validation = state.get("draft_validation")
 
@@ -560,6 +587,20 @@ def _route_after_validate(state: TriageState) -> str:
     #   make. Quarantine encodes "this specific text must not leave the
     #   building", which is not a preference and is not negotiable by config.
     if draft_validation is not None and draft_validation.quarantined:
+        return "persist_pending"
+
+    # D80 — the second gate that survives AUTO_SEND_MODE, and it is here for
+    # the same reason as the first. Quarantine says "these bytes must not
+    # leave"; requires_human says "this DECISION was not made on evidence".
+    # The fit scorer sets it when it abstained: a draft exists, but it was
+    # written on the strength of a number the model explicitly told us to
+    # ignore, and sending that unsupervised is how an abstention becomes a
+    # confident claim to a recruiter.
+    # WHY not folded into the quarantine check: they are different failures
+    # and will diverge. A quarantined draft is a content problem a human might
+    # fix by editing; an abstention is an evidence problem a human resolves by
+    # deciding. Keeping them separate keeps the reason legible in the trace.
+    if state.get("requires_human"):
         return "persist_pending"
 
     # off → the Phase 5 human-approval path, unchanged.

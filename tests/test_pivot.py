@@ -215,11 +215,30 @@ def _score_node_decision(score: int, uncertain: bool):
         return node({"opportunity": _opp()})
 
 
-def test_uncertain_below_threshold_now_pivots_not_interested():
-    """The regression that sent 'I'm interested' to a QA lead and a .NET role."""
+def test_uncertain_drafts_interested_behind_a_human_gate():
+    """D80 reverses what D66 asserted here. Both halves matter.
+
+    D66 changed this branch because abstentions were reaching recruiters as
+    "I'm interested" — 17 of 19 such replies went to roles below threshold,
+    including a QA lead and a .NET backend role. That concern was real and is
+    NOT being undone.
+
+    What D66 got wrong was the remedy. Routing on the score alone made an
+    abstention (which returns 0) indistinguishable from a confident zero, so
+    it pivoted — and PIVOT asserts a reason: "this isn't the direction I'm
+    heading". Sent to an Artificial Intelligence Engineer role, remote,
+    RAG/LLM/NLP, whose own rationale read "strongly aligns". Trading a wrong
+    "yes" for a wrong "no" is not a fix.
+
+    D80 keeps INTERESTED and answers D66's concern with `requires_human`
+    instead: the reply is drafted, and a person sees it before it goes
+    anywhere. The gate is what D54 lacked.
+    """
     out = _score_node_decision(score=0, uncertain=True)
-    assert out["draft_type"] == DraftType.PIVOT
-    assert out["resume_requested"] is True
+    assert out["draft_type"] == DraftType.INTERESTED
+    assert out["requires_human"] is True
+    # And it must NOT claim a reason it never established.
+    assert out["draft_type"] != DraftType.PIVOT
 
 
 def test_uncertain_above_threshold_is_still_interested():
