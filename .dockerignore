@@ -14,7 +14,12 @@ candidate.toml
 .gitignore
 logs/
 tests/
-alembic/
+# GOTCHA: alembic/ is deliberately NOT excluded, though it looks like it should
+# be — nothing at runtime imports it. The deploy runs `alembic upgrade head` in
+# a throwaway container built from this image (D82), and alembic.ini sets
+# `script_location = alembic`. Re-adding it here makes `COPY alembic ./alembic`
+# fail the build with "no source files were specified", which is an obscure way
+# to discover that migrations no longer ship.
 docs/
 scripts/
 .venv/

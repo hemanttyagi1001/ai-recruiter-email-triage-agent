@@ -1873,3 +1873,44 @@ nothing to show for it. A stray draft is one click to delete.
 **Revisit if:** the operator starts using Gmail drafts as a staging area they
 edit over days (an unsent draft would then be meaningful state this rule
 ignores), or if send-as aliases make the SENT label ambiguous.
+
+## D82 — Deploy by SSH from a hosted runner, with config pinned to the box (2026-09-21)
+
+**Decision:** push to `main` triggers `.github/workflows/deploy.yml`, which runs
+on `ubuntu-latest` and uses `appleboy/ssh-action` to execute a build/migrate/
+restart script *on* the VPS. The runner never checks out the repo; a clone
+already lives at `/root/apps/ai-recruiter-email-triage-agent`. This mirrors the
+pipeline already working in `hemant-tyagi-client`.
+
+**Alternatives considered:** a self-hosted GitHub runner on the VPS, which
+removes the SSH secrets and runs the deploy locally. Rejected for now
+because it needs a runner agent installed and kept alive on the box, and a
+second deploy topology to reason about, to save one action. Also rejected:
+building and pushing an image to a registry — the VPS is the only consumer, so
+a registry adds a hop and a credential for nothing.
+
+**Configuration never travels through CI.** Five files (`.env`,
+`credentials.json`, `token.json`, `candidate.toml`, the resume PDF) are
+gitignored and placed on the VPS once by hand. The deploy uses `git reset
+--hard` and deliberately never `git clean -fd`, so untracked files survive every
+push. Putting them in GitHub Secrets and writing them out on deploy was
+rejected: `token.json` is *rewritten by the agent* on every hourly refresh, so
+CI would overwrite live state with a stale copy on each deploy.
+
+**Migrations run in a throwaway container with the agent stopped** —
+`docker compose run --rm agent alembic upgrade head`, between `down` and `up`.
+An entrypoint that migrates on every start was rejected: it reruns on crash
+loops and hides failures in `docker logs` rather than failing the Actions run.
+The build happens *before* the `down` so a broken build costs zero downtime.
+This is why the Dockerfile now COPYs `alembic/` and `alembic.ini`, which nothing
+at runtime reads.
+
+**No reverse proxy, no TLS, no exposed port.** The container runs the poll loop;
+`app/api` is not started by compose. Approval happens in Gmail Drafts under
+`AUTO_SEND_MODE=draft`, so there is nothing to serve and nothing to protect.
+
+**Revisit if:** the `/pending` API becomes the approval path (then it needs a
+compose service, nginx, certbot and authentication in front of it — a
+human-approval endpoint on the open internet is not acceptable unauthenticated),
+or if a second environment appears and one clone on one box stops being the
+whole topology.
