@@ -1,0 +1,119 @@
+# Continuous deployment to the VPS.
+#
+# What this does and why it exists here: every push to main rebuilds the agent
+# image on the VPS and restarts the poll loop against the new code. The repo
+# carries no secrets, so the deploy never *delivers* configuration — it only
+# updates code and leaves the five hand-placed files on the box untouched.
+# See DEPLOY.md for the one-time bootstrap those files require, and D82.
+#
+# TRACE: on push to main —
+#   1. GitHub spins up an ubuntu-latest runner. It does NOT check out the repo;
+#      nothing in this job reads the source. The runner exists only to hold an
+#      SSH session open.
+#   2. appleboy/ssh-action opens SSH to the VPS and runs the script below
+#      *on the VPS*, where a full clone of this repo already lives.
+#   3. The VPS pulls, builds, migrates, and restarts. The runner streams stdout
+#      back, so the Actions log is the deploy log.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  # WHY workflow_dispatch: a redeploy is sometimes needed without a code change
+  # — after editing .env on the box, or rotating token.json. Without this the
+  # only way to redeploy is an empty commit.
+  workflow_dispatch:
+
+# GOTCHA: this is required for JavaScript actions to run on the Node 24 runtime
+# that current runner images ship. Without it, actions pinned to older Node
+# majors emit a deprecation failure rather than a warning.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# CONCEPT: concurrency groups. Two pushes landing a minute apart would
+#   otherwise open two SSH sessions that both run `compose down` / `up` against
+#   the same directory, and the loser can leave the stack down. Serialising on
+#   a fixed group name means the second run waits for the first.
+# WHY cancel-in-progress is false: cancelling mid-deploy could kill the SSH
+#   session between `alembic upgrade head` and `compose up`, leaving a migrated
+#   database with no agent running. Queue instead of cancel.
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to VPS over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          timeout: 60s
+          # WHY 15m: the image build installs the whole dependency tree
+          # (psycopg, langgraph, google-api-python-client). A cold build with no
+          # layer cache runs several minutes; 15m leaves headroom without
+          # hanging a broken deploy forever.
+          command_timeout: 15m
+          script: |
+            set -e
+            cd /root/apps/ai-recruiter-email-triage-agent
+
+            # GOTCHA: `git reset --hard` deliberately, and `git clean` NEVER.
+            # Five files this agent cannot start without are gitignored and live
+            # only on this box: .env, credentials.json, token.json,
+            # candidate.toml and the resume PDF. reset --hard rewrites tracked
+            # files and leaves untracked ones alone, which is exactly what we
+            # want. Adding `git clean -fd` here would wipe the OAuth refresh
+            # token and the Azure key on the next push, and the agent would come
+            # back up unable to authenticate. Do not add it.
+            git fetch origin main
+            git reset --hard origin/main
+
+            # WHY build before stopping anything: a build failure (bad
+            # dependency pin, syntax error in a COPYed file) then costs zero
+            # downtime — the old container is still running and serving the
+            # poll loop. Stop first and a broken build leaves the inbox
+            # unattended until someone notices.
+            docker compose build
+
+            # TRACE: SIGTERM, then up to 60s of grace (see docker-compose.yml).
+            # app/cli/watch.py catches it and finishes the message in flight,
+            # so a deploy lands between messages rather than mid-graph.
+            docker compose down --remove-orphans
+
+            # Defensive: a container left behind by a previous non-compose run
+            # would hold the name and make `up` fail.
+            docker rm -f ai-recruiter-email-triage-agent 2>/dev/null || true
+
+            # CONCEPT: migrate with the agent stopped, in a throwaway container.
+            #   `compose run --rm` starts a one-off container from the same
+            #   image and service definition — same env_file, same
+            #   DATABASE_URL, same mounts — then deletes it. Running this while
+            #   the agent is down means no process is reading a schema that is
+            #   halfway changed.
+            # WHY not an entrypoint that migrates on every start: that reruns on
+            #   every restart, including crash loops, and buries failures in
+            #   docker logs. Here a failed migration fails the step, `set -e`
+            #   aborts, and the Actions run goes red with the traceback visible.
+            # GOTCHA: this is also why the Dockerfile COPYs alembic/ and
+            #   alembic.ini. They are not needed by the agent at runtime, only
+            #   by this line.
+            docker compose run --rm agent alembic upgrade head
+
+            docker compose up -d --force-recreate
+
+            # Old image layers from previous builds accumulate fast on a small
+            # VPS disk. -f skips the confirmation prompt; only dangling images
+            # are removed, so nothing in use is touched.
+            docker image prune -f
+
+            # Leave proof in the Actions log that the loop actually came back,
+            # rather than reporting success because `up -d` returned 0.
+            sleep 5
+            docker compose ps
+            docker compose logs --tail 30 agent

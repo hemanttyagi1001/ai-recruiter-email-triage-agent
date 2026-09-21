@@ -29,6 +29,21 @@ COPY pyproject.toml ./
 COPY app ./app
 RUN pip install --no-cache-dir "."
 
+# WHY the migrations ship in the image: the deploy runs `docker compose run
+# --rm agent alembic upgrade head` against this same image (see
+# .github/workflows/deploy.yml). The `alembic` console script arrives with the
+# pip install above, but a bare binary is useless — alembic.ini sets
+# `script_location = alembic`, so without the directory it exits with
+# "Path doesn't exist: alembic" and the deploy fails after the agent is already
+# stopped.
+# GOTCHA: copied AFTER the pip install on purpose. Migrations change far more
+# often than dependencies do, and putting them earlier would invalidate the
+# install layer — turning a 5-second rebuild into a full dependency download on
+# every schema change.
+# Nothing at runtime reads these; the agent process never touches alembic.
+COPY alembic.ini ./
+COPY alembic ./alembic
+
 # WHY a non-root user: this process parses untrusted email content. It needs no
 # write access to anything but the log directory, so it should not have any.
 # GOTCHA: logs/ is created and chowned BEFORE dropping privileges — a non-root
