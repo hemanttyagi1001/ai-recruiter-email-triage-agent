@@ -2,6 +2,12 @@
 credentials.json
 token.json
 candidate.toml
+# Machine-specific compose settings. Compose merges this automatically when it
+# is present, so committing one would silently change how the VPS deploys —
+# the deploy does `git reset --hard`, and anything tracked lands there too.
+# Keeping it untracked is what makes it safe to disable the agent locally
+# without disabling it in production.
+docker-compose.override.yml
 # Resume PDF — personal document, attached to outbound mail at runtime.
 # Mounted into the container by docker-compose, never baked into the image.
 *.pdf
