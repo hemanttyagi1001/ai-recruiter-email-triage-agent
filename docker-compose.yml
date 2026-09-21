@@ -16,9 +16,15 @@ services:
     # CONCEPT: reaching a database that is NOT part of this compose project.
     #   Inside a container, `localhost` is the container itself, so the
     #   DATABASE_URL in .env (which points at localhost:5432 for host-side CLI
-    #   use) cannot work here. `host.docker.internal` resolves to the Docker
-    #   host, which is where the standalone `pgvector` container publishes
-    #   5432. The agent therefore talks to the same database the host CLI does.
+    #   use) cannot work here. Two shapes of DOCKER_DATABASE_URL are valid, and
+    #   which one is right depends on where the database lives:
+    #     - `host.docker.internal:5432` — a pgvector container on the Docker
+    #       HOST that publishes 5432. The local-development shape, and the
+    #       reason `extra_hosts` below still exists.
+    #     - `postgres18:5432` — the shared pgvector container on the VPS,
+    #       reached over `postgress-net` (declared at the bottom of this file).
+    #       That container publishes NO host port deliberately, so joining its
+    #       network is the only way in. See D82.
     # WHY a separate env var instead of editing DATABASE_URL: the CLI, pytest
     # and alembic all still run on the host and need the localhost form. One
     # variable per audience beats one variable that is wrong for someone.
@@ -43,6 +49,20 @@ services:
     # explicitly makes the same compose file work in both places.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+    # CONCEPT: joining a network this compose project does not own.
+    #   `external: true` at the bottom means "this network already exists —
+    #   attach to it, do not create it". Docker's embedded DNS then resolves
+    #   the other containers on it by name, which is how `postgres18:5432`
+    #   works with no published port and nothing exposed to the internet.
+    # GOTCHA: external means exactly that. On a machine where the network does
+    #   not exist yet, `docker compose up` fails with "network postgress-net
+    #   declared as external, but could not be found" — it will NOT helpfully
+    #   create one. Run `docker network create postgress-net` once per machine.
+    #   On the VPS this is already done, and the database container is attached
+    #   to it alongside its own project network.
+    networks:
+      - postgress-net
 
     # D69: pin public resolvers instead of inheriting Docker's embedded one.
     # WHY: Docker's built-in resolver at 127.0.0.11 forwards to whatever the
@@ -92,39 +112,28 @@ services:
     stop_signal: SIGTERM
     stop_grace_period: 60s
 
-  # ---------------------------------------------------------------------------
-  # Optional bundled Postgres. NOT started by default.
-  # ---------------------------------------------------------------------------
-  # WHY behind a profile: this project's operator already runs a standalone
-  # `pgvector` container publishing 5432 for several projects. Starting this
-  # service too would collide on that port, and the agent would then be pointed
-  # at whichever container won the race — with a different database inside it.
-  # A profile means `docker compose up` cannot start it by accident.
-  #
-  # To use this one INSTEAD of the standalone container:
-  #   docker compose --profile bundled-db up -d
-  # and point DOCKER_DATABASE_URL at `db:5432` rather than
-  # host.docker.internal (compose puts both services on one network, so the
-  # service name resolves).
-  db:
-    profiles: ["bundled-db"]
-    image: pgvector/pgvector:pg16
-    container_name: triage_db
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: triage
-      POSTGRES_PASSWORD: triage_local
-      POSTGRES_DB: triage
-    ports:
-      - "5432:5432"
-    volumes:
-      - triage_pg:/var/lib/postgresql/data
-      - ./scripts/init_test_db.sql:/docker-entrypoint-initdb.d/init_test_db.sql:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U triage -d triage"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+# This file declares no database service, and that is deliberate (D82).
+#
+# An earlier `db:` service behind a `bundled-db` profile was removed. It carried
+# two live hazards that a profile flag does not defuse: it published 5432 with
+# `- "5432:5432"`, which on a VPS means the open internet, and its password was
+# a literal in this tracked file — in a public repo. Docker's port publishing
+# writes its own iptables rules ahead of UFW, so "the firewall will catch it"
+# was not true either. Anyone who ran `--profile bundled-db` on a server got an
+# internet-facing Postgres with a published password and no warning.
+#
+# The database is now a container this project does not own, reached by name
+# over `postgress-net`. Nothing about it is published to a host port.
 
-volumes:
-  triage_pg:
+networks:
+  # CONCEPT: an external network is a shared bus between compose projects.
+  #   Declaring it here attaches this project's containers to a network created
+  #   outside it, so `postgres18` resolves by DNS from inside the agent. The
+  #   database stays unpublished; the only things that can reach it are
+  #   containers explicitly joined to this network.
+  # GOTCHA: create it before the first `docker compose up` on any new machine —
+  #   `docker network create postgress-net`. Compose will not create an
+  #   external network for you; it fails with "declared as external, but could
+  #   not be found".
+  postgress-net:
+    external: true

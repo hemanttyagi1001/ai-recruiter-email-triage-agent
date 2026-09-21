@@ -1889,6 +1889,27 @@ second deploy topology to reason about, to save one action. Also rejected:
 building and pushing an image to a registry — the VPS is the only consumer, so
 a registry adds a hop and a credential for nothing.
 
+**Database: the shared `postgres18` container, reached over `postgress-net`.**
+The VPS had a Postgres but not a pgvector one — `postgres:18-alpine`, which has
+no `vector` extension available and publishes no host port. Rather than run a
+second database, that container was rebuilt on `pgvector/pgvector:pg18` and a
+dedicated `postgress-net` network now joins it to application containers by DNS
+name. Rejected: publishing a host port (the shared project's compose file
+deliberately publishes none, citing a prior exposure incident), and an in-place
+image swap on the existing volume — every pgvector image is Debian/glibc while
+the cluster was Alpine/musl, and collation differs between them, so text indexes
+would have been silently wrong without a full REINDEX. The cluster was empty and
+hours old, so it was dropped and reinitialised instead. Alpine was considered
+for size (~170MB smaller) and rejected: no official Alpine pgvector image
+exists, so it would mean maintaining a custom build, and musl's locale support
+is weaker than glibc's on a database whose indexes sort text.
+
+**The bundled `db` service was deleted from this repo's compose file.** It
+published `5432:5432` with a password written into a tracked file, in a public
+repo. A `profiles:` guard does not defuse that — anyone running
+`--profile bundled-db` on a server got an internet-facing Postgres, and Docker's
+iptables rules sit ahead of UFW, so a host firewall would not have stopped it.
+
 **Configuration never travels through CI.** Five files (`.env`,
 `credentials.json`, `token.json`, `candidate.toml`, the resume PDF) are
 gitignored and placed on the VPS once by hand. The deploy uses `git reset
