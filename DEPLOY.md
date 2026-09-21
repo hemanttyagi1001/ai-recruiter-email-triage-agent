@@ -89,7 +89,15 @@ Then fix ownership and permissions:
 cd /root/apps/ai-recruiter-email-triage-agent
 chmod 600 .env credentials.json token.json
 chown 10001:10001 token.json
+mkdir -p logs && chown -R 10001:10001 logs
 ```
+
+Both `chown`s matter, for the same reason: a **bind mount carries the host's
+ownership into the container**, masking whatever the Dockerfile chowned. The
+container runs as UID 10001 and must write to both paths — `token.json` on every
+hourly OAuth refresh, `logs/watch.log` on every line it logs. Root-owned either
+way and the agent fails. The deploy script re-applies the `logs/` one on every
+run; `token.json` it deliberately does not touch.
 
 **The `chown 10001` is not optional.** The container drops to UID 10001
 (`Dockerfile`), and `load_credentials` rewrites `token.json` in place every time
@@ -204,6 +212,8 @@ on the box takes effect with no restart at all.
 
 | Symptom | Cause |
 |---|---|
+| `PermissionError: '/app/logs/watch.log'`, container restarting forever | `logs/` on the host not owned by UID 10001. The bind mount masks the image's own chown |
+| Deploy went green but nothing is working | Check `docker compose ps`. Before the health gate existed, a crash-looping container still produced a successful run |
 | Authenticates for an hour, then permission errors | `token.json` not owned by UID 10001 |
 | `insufficientPermissions` on one call only | An optional scope is missing; `mark_read` degrades, everything else runs |
 | `invalid_scope` on refresh, nothing works | Token consented to fewer scopes than requested — delete `token.json`, re-run the consent flow on your workstation, copy it back (see D69) |

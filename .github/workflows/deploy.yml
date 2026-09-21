@@ -74,6 +74,19 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
 
+            # GOTCHA: logs/ is a BIND MOUNT, so the host directory's ownership
+            # wins over anything the Dockerfile chowned. The image chowns
+            # /app/logs to uid 10001, but that layer is masked the moment the
+            # host directory is mounted over it — and a fresh `git clone` as
+            # root leaves logs/ owned by root. The container then starts, calls
+            # _configure_logging(), and dies on
+            #   PermissionError: [Errno 13] ... '/app/logs/watch.log'
+            # restarting forever. Same class of trap as token.json, and it cost
+            # a green deploy with a crash-looping container on 2026-09-21.
+            # Idempotent, so it is safe to run on every deploy.
+            mkdir -p logs
+            chown -R 10001:10001 logs
+
             # WHY build before stopping anything: a build failure (bad
             # dependency pin, syntax error in a COPYed file) then costs zero
             # downtime — the old container is still running and serving the
@@ -112,8 +125,29 @@ jobs:
             # are removed, so nothing in use is touched.
             docker image prune -f
 
-            # Leave proof in the Actions log that the loop actually came back,
-            # rather than reporting success because `up -d` returned 0.
-            sleep 5
+            # CONCEPT: `docker compose up -d` returning 0 is NOT a successful
+            #   deploy. It means "the container was created and started" — a
+            #   process that starts and immediately dies satisfies it. With
+            #   `restart: unless-stopped` the container then crash-loops
+            #   silently while the Actions run shows a green tick.
+            # WHY this gate exists: that is exactly what happened on the first
+            #   real deploy. Every step passed, the job went green, and the
+            #   agent was dying on startup every few seconds. A deploy that
+            #   cannot tell you this is worse than no deploy, because it
+            #   actively reports the wrong thing.
+            # TRACE: wait out the startup window, then judge on two signals —
+            #   status must be `running`, and RestartCount must still be 0. A
+            #   freshly recreated container starts at 0, so any increment
+            #   inside the window means it has already died at least once.
+            sleep 20
             docker compose ps
-            docker compose logs --tail 30 agent
+            docker compose logs --tail 40 agent
+
+            STATUS=$(docker inspect -f '{{.State.Status}}' ai-recruiter-email-triage-agent 2>/dev/null || echo missing)
+            RESTARTS=$(docker inspect -f '{{.RestartCount}}' ai-recruiter-email-triage-agent 2>/dev/null || echo 0)
+            echo "post-deploy: status=$STATUS restarts=$RESTARTS"
+            if [ "$STATUS" != "running" ] || [ "$RESTARTS" -gt 0 ]; then
+              echo "::error::Agent is not healthy after deploy (status=$STATUS, restarts=$RESTARTS). See the logs above."
+              exit 1
+            fi
+            echo "Agent is up and has not restarted."
