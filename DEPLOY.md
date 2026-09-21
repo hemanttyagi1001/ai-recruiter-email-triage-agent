@@ -17,28 +17,42 @@ Get those five right and the pipeline is the easy part.
 
 - Docker Engine with the Compose v2 plugin (`docker compose`, not
   `docker-compose`)
-- A Postgres server with the `pgvector` extension available, publishing
-  **5432 on the host**. This is the shared `pgvector` container already running
-  on the box for other projects.
+- The shared `postgres18` container running `pgvector/pgvector:pg18`, managed
+  by its own compose project at `/root/postgres/`
+- The `postgress-net` docker network, with both that container and this one
+  attached to it
 - SSH access as the user the pipeline will connect as
+
+### The network
+
+The database publishes **no host port** — deliberately. It is reachable only by
+containers that join its network, which is why this project's
+`docker-compose.yml` declares `postgress-net` as external and attaches the agent
+to it. Docker's embedded DNS then resolves `postgres18` by name.
+
+```bash
+docker network create postgress-net        # once per machine; harmless if it exists
+```
+
+Compose will **not** create an external network for you. On a machine where it
+is missing, `docker compose up` fails with *"network postgress-net declared as
+external, but could not be found"*.
 
 ### Create the database
 
-The agent will not create its own database. From the VPS:
+The agent will not create its own database:
 
 ```bash
-docker exec -it pgvector psql -U postgres -c "CREATE DATABASE triage;"
-docker exec -it pgvector psql -U postgres -c \
-  "CREATE USER triage WITH PASSWORD 'choose-a-real-password';"
-docker exec -it pgvector psql -U postgres -c \
-  "GRANT ALL PRIVILEGES ON DATABASE triage TO triage;"
+PW=$(openssl rand -base64 24 | tr -d '/+=' | head -c 28)
+docker exec postgres18 psql -U postgres -c "CREATE ROLE triage LOGIN PASSWORD '$PW';"
+docker exec postgres18 psql -U postgres -c "CREATE DATABASE triage OWNER triage;"
+docker exec postgres18 psql -U postgres -d triage -c "CREATE EXTENSION IF NOT EXISTS vector;"
+echo "$PW"   # put this in DOCKER_DATABASE_URL below, then forget it
 ```
 
-> The `vector` extension is created by migration `0004`, not by you — but the
-> role running migrations must be allowed to `CREATE EXTENSION`. On the
-> `pgvector/pgvector` image the `postgres` superuser can; a plain role cannot.
-> Either run migrations as a superuser once, or `CREATE EXTENSION vector;`
-> inside the `triage` database yourself before the first deploy.
+> Migration `0004` also runs `CREATE EXTENSION IF NOT EXISTS vector`, but the
+> `triage` role is not a superuser and cannot create extensions. Creating it
+> once as `postgres` above makes that migration a no-op instead of a failure.
 
 ### Clone the repo
 
@@ -86,16 +100,19 @@ looks nothing like its cause.
 ### Set the container's database URL
 
 Inside a container `localhost` is the container itself, so `DATABASE_URL` from
-`.env` cannot reach the host's Postgres. Compose reads a separate variable for
-this. In the VPS `.env`:
+`.env` cannot reach the database. Compose reads a separate variable for this. In
+the VPS `.env`:
 
 ```bash
-DOCKER_DATABASE_URL=postgresql+psycopg://triage:choose-a-real-password@host.docker.internal:5432/triage
+DOCKER_DATABASE_URL=postgresql+psycopg://triage:THE_PASSWORD@postgres18:5432/triage
 ```
 
-`host.docker.internal` resolves on Linux only because `docker-compose.yml`
-declares `extra_hosts: host.docker.internal:host-gateway`. Docker Desktop
-provides it for free; plain Docker Engine does not.
+`postgres18` is a container name, resolved by Docker's embedded DNS because both
+containers sit on `postgress-net`. There is no host port and no IP to hardcode.
+
+> Locally the shape is different — `host.docker.internal:5432` against a
+> pgvector container that does publish 5432. Both work; `extra_hosts` in
+> `docker-compose.yml` exists for the local one. One variable per environment.
 
 ### First run, by hand
 
@@ -191,6 +208,9 @@ on the box takes effect with no restart at all.
 | `insufficientPermissions` on one call only | An optional scope is missing; `mark_read` degrades, everything else runs |
 | `invalid_scope` on refresh, nothing works | Token consented to fewer scopes than requested — delete `token.json`, re-run the consent flow on your workstation, copy it back (see D69) |
 | Deploy fails at `alembic upgrade head` | Agent is already stopped. Fix the migration, push again — step 2 rebuilds before anything stops |
+| `network postgress-net declared as external, but could not be found` | Run `docker network create postgress-net` on that machine. Compose never creates an external network itself |
+| `could not translate host name "postgres18"` | The agent is not on `postgress-net`, or the database container isn't. Check `docker inspect <name> --format '{{json .NetworkSettings.Networks}}'` on both |
+| Migration `0004` fails on `CREATE EXTENSION vector` | The `triage` role is not a superuser. Run the `CREATE EXTENSION` once as `postgres` (§1) |
 | `NameResolutionError` on Google or Azure | DNS; compose pins 8.8.8.8 and 1.1.1.1 for this reason (D69) |
 | Every attachment fails, resume is empty | The PDF was missing at `up` time, so Compose created a directory at the mount point. Place the file, then `docker compose up -d --force-recreate` |
 
