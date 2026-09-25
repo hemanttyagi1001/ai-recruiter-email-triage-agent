@@ -29,7 +29,7 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
-from app.candidate import NA, CandidateProfile, render
+from app.candidate import NA, CandidateProfile, render, render_ctc_band
 from app.gmail.parser import ParsedMessage
 from app.llm.schemas import Opportunity
 
@@ -65,23 +65,19 @@ def build_interested(
     profile: CandidateProfile,
     resume_attached: bool = False,
 ) -> str:
-    c = profile.candidate
-    # TRACE: every slot goes through render(), so an unfilled profile field
-    # becomes the literal "NA" rather than raising a TypeError on format() or
-    # emitting Python's "None". The template itself is unchanged — it has no
-    # idea a value was missing, which is what keeps it a dumb string.
+    # TRACE (D83): the nine profile slots this template used to interpolate one
+    # by one are now a single block, built by the same render_facts_block() the
+    # LLM and questionnaire paths call. D68 fixed the packed two-fields-per-line
+    # shape ("Current CTC: 26 LPA · Expected: 36 LPA") in those two paths and
+    # left this one behind, so a recruiter's reply format depended on which
+    # drafter happened to fire. One renderer is what stops that recurring.
+    # GOTCHA: the block drops any field whose value is unset instead of writing
+    # "NA", so an unfilled profile now yields a SHORTER list here rather than a
+    # list with NA in it — the opposite of the old behaviour on this path.
     body = _INTERESTED_TEMPLATE.format(
         salutation=_salutation(parsed, opp),
         about_role=_about_role_clause(opp),
-        total_years=render(c.total_years),
-        relevant_years=render(c.relevant_years),
-        stack=render(c.stack),
-        current_ctc_lpa=render(c.current_ctc_lpa),
-        notice_period=render(c.notice_period),
-        current_location=render(c.current_location),
-        preferred_location=render(c.preferred_location),
-        employment_status=render(c.employment_status),
-        expected_ctc=_expected_ctc(c.expected_ctc_lpa),
+        facts_block=render_facts_block(profile),
         budget_line=_budget_line(opp, profile),
         clarifications_block=_clarifications_block(opp, profile),
         closing=_closing(opp, profile, resume_attached),
@@ -183,7 +179,9 @@ def _answer_table(profile: CandidateProfile) -> dict[str, str]:
         "Reason for Job Change": render(c.reason_for_job_change),
         "Notice Period": render(c.notice_period),
         "Current CTC": f"{render(c.current_ctc_lpa)} LPA",
-        "Expected CTC": _expected_ctc(c.expected_ctc_lpa),
+        "Expected CTC": _expected_ctc(
+            c.expected_ctc_min_lpa, c.expected_ctc_max_lpa
+        ),
         # WHY this maps to notice period: "last working day" is what the form
         # asks when it assumes you have already left. Answering with the
         # notice period is the truthful response for someone still employed,
@@ -493,19 +491,23 @@ def _about_role_clause(opp: Opportunity | None) -> str:
     return ""
 
 
-def _expected_ctc(expected: float | None) -> str:
-    """Render the expectation as a negotiable figure.
+def _expected_ctc(lo: float | None, hi: float | None) -> str:
+    """The expected-CTC band, marked negotiable, for outbound mail only.
 
     WHY "(negotiable)" is attached here rather than typed into candidate.toml:
     it is a property of how we open a conversation, not a fact about the
     candidate. A number stated flatly invites a yes/no; the same number marked
     negotiable invites a counter-offer, which is the point of a first reply.
+    It is also why this wrapper exists at all rather than every caller using
+    render_ctc_band() — the scorer must see the band WITHOUT the invitation.
+
     GOTCHA: an unset expectation must stay bare "NA" — "NA (negotiable)" reads
     as nonsense and advertises an unconfigured profile.
     """
-    if expected is None:
+    band = render_ctc_band(lo, hi)
+    if band == NA:
         return NA
-    return f"{render(expected)} LPA (negotiable)"
+    return f"{band} (negotiable)"
 
 
 def _budget_accepted(opp: Opportunity | None, profile: CandidateProfile | None) -> bool:

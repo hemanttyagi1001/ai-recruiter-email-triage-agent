@@ -184,8 +184,11 @@ def test_interested_template_no_longer_nests_parentheses(parsed_factory):
 
     profile = load_profile()
     body = build_interested(parsed_factory(), _opp(), profile)
-    assert "Total experience:" in body
-    assert "Relevant experience:" in body
+    # D83: labels are Title Case here because this draft no longer carries its
+    # own bullet list — it renders the same shared facts block the LLM and
+    # questionnaire paths use, whose labels come from _answer_table.
+    assert "Total Experience:" in body
+    assert "Relevant Experience:" in body
     # The old single-bullet form wrapped stack in parens; with a stack string
     # that itself contains parens that produced unbalanced-looking output.
     assert "years (6 years in" not in body

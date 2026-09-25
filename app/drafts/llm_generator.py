@@ -57,7 +57,7 @@ from collections.abc import Sequence
 
 from pydantic import BaseModel, Field
 
-from app.candidate import NA, CandidateProfile, render
+from app.candidate import NA, CandidateProfile, render, render_ctc_band
 from app.gmail.parser import ParsedMessage
 from app.llm.client import LLMClient, Usage
 from app.llm.schemas import Opportunity
@@ -89,6 +89,15 @@ class ReplyDraft(BaseModel):
 
 def _system_prompt(profile: CandidateProfile) -> str:
     c = profile.candidate
+    # WHY hard rule 3 binds to the MIN of the band and not the max (D83): the
+    # band's bottom is the only figure the candidate has actually agreed to
+    # accept. Pointing the rule at 42 when the stated range opens at 36 would
+    # have the model refuse offers the candidate wants to hear.
+    # GOTCHA: this is a rule in a prompt string, so it is a request, not an
+    # enforcement — a model can and eventually will name a lower number. The
+    # standing rule in CLAUDE.md says hard limits belong in a validator, and
+    # the outbound validator does not yet check for an undercutting figure.
+    # Treat every compensation sentence in an LLM-drafted reply as unreviewed.
     return f"""You write short, professional email replies to recruiters on \
 behalf of one specific candidate. You are writing as the candidate.
 
@@ -96,7 +105,7 @@ THE CANDIDATE — these are the ONLY facts you know about them:
 - Total experience: {render(c.total_years)} years
 - Relevant experience: {render(c.relevant_years)} years in {render(c.stack)}
 - Current CTC: {render(c.current_ctc_lpa)} LPA
-- Expected CTC: {render(c.expected_ctc_lpa)} LPA (describe this as negotiable)
+- Expected CTC: {render_ctc_band(c.expected_ctc_min_lpa, c.expected_ctc_max_lpa)} (describe this as negotiable)
 - Notice period: {render(c.notice_period)}
 - Current location: {render(c.current_location)}
 - Preferred location: {render(c.preferred_location)}
@@ -110,7 +119,7 @@ guess and do not imply. Say plainly that you would be glad to cover it on a \
 call, or ask what specifically they need.
 2. A value of "{NA}" means unknown. Never write "{NA}" into the reply, and \
 never invent a replacement — omit that point entirely.
-3. Never agree to a compensation figure below {render(c.expected_ctc_lpa)} \
+3. Never agree to a compensation figure below {render(c.expected_ctc_min_lpa)} \
 LPA. You may say the expectation is negotiable. You may not name a lower number.
 4. Do not promise availability, start dates, documents, or interviews beyond \
 the notice period stated above.

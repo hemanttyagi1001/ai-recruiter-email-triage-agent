@@ -18,7 +18,13 @@ import logging
 import tomllib
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +33,13 @@ log = logging.getLogger(__name__)
 # the draft template, the fit-scorer prompt, and the startup warning can never
 # drift into disagreeing about what "unfilled" looks like.
 NA = "NA"
+
+
+# Fields left out of the unfilled-profile warning at startup: `name` because it
+# is required and can never be None, and `expected_ctc_lpa` because a profile
+# on the D83 min/max band leaves it empty deliberately — listing it would tell
+# the operator to go and fill in a field they have correctly stopped using.
+_NOT_REPORTED_MISSING = frozenset({"name", "expected_ctc_lpa"})
 
 
 def render(value: object | None) -> str:
@@ -47,6 +60,35 @@ def render(value: object | None) -> str:
     if isinstance(value, float):
         return str(int(value)) if value == int(value) else str(value)
     return str(value)
+
+
+def render_ctc_band(lo: float | None, hi: float | None) -> str:
+    """Render an expected-CTC band as prose, or NA if neither end is set.
+
+    WHY this lives beside render() rather than in the draft generator (D83):
+    three separate prompts state this number — the outbound draft, the
+    fit-scorer's candidate block, and the LLM drafter's fact list. The same
+    argument that put float formatting in render() applies with more force to
+    a salary band: two renderers eventually disagree, and the version the
+    recruiter reads stops matching the version the scorer reasoned about.
+
+    WHY " to " rather than a hyphen: the result is re-keyed into ATS fields and
+    read off screening forms, where a hyphen between two numbers reads as a
+    minus sign and vanishes at a line wrap. Repeating the unit on both ends
+    survives both.
+
+    GOTCHA: no "(negotiable)" here. That word is a negotiating posture that
+    belongs only in outbound mail — putting it in the scorer's prompt would
+    invite the model to discount the floor it was given.
+    """
+    if lo is None and hi is None:
+        return NA
+    # TRACE: a pre-D83 profile reaches this as a zero-width band, because the
+    # validator copied its single figure into both ends. Collapsing that back
+    # to one number is what keeps such a profile's output byte-identical.
+    if lo is None or hi is None or lo == hi:
+        return f"{render(hi if lo is None else lo)} LPA"
+    return f"{render(lo)} LPA to {render(hi)} LPA"
 
 
 class _Candidate(BaseModel):
@@ -71,7 +113,16 @@ class _Candidate(BaseModel):
     relevant_years: float | None = None
     stack: str | None = None
     current_ctc_lpa: float | None = None
+    # D83: the expectation is a band, not a point. A single figure invites a
+    # yes/no; a band gives the recruiter somewhere to land without the
+    # candidate naming their walk-away number first.
+    # GOTCHA: `expected_ctc_lpa` is the pre-D83 single figure and is kept only
+    # so profiles written before this change still boot. Nothing reads it
+    # directly — _expected_ctc_band below folds it into the pair, and every
+    # consumer reads min/max. Do not add a new reference to it.
     expected_ctc_lpa: float | None = None
+    expected_ctc_min_lpa: float | None = None
+    expected_ctc_max_lpa: float | None = None
     notice_period: str | None = None
     current_location: str | None = None
     preferred_location: str | None = None
@@ -128,6 +179,51 @@ class _Candidate(BaseModel):
             return None
         return v
 
+    @model_validator(mode="after")
+    def _expected_ctc_band(self) -> _Candidate:
+        """Fold the pre-D83 single figure into the band, and reject an inverted one.
+
+        CONCEPT: widening a schema without breaking the configs already in the
+        wild. Deleting `expected_ctc_lpa` outright would be the clean change
+        and also a boot failure — this model forbids extra keys, so any
+        profile still carrying that key fails validation at import. The copy
+        that matters is the one on the deployment host: it is gitignored, so a
+        deploy never rewrites it, and the process would come back up dead on a
+        config nobody touched. Accepting the old key and folding it into the
+        new shape costs one validator and makes the migration a no-op.
+
+        A lone figure becomes a zero-width band (min == max), which renders
+        back as a single number — so a pre-D83 profile produces byte-identical
+        outbound text.
+
+        GOTCHA: an inverted band raises rather than silently swapping the ends.
+        min > max is a typo in a number that goes out to a recruiter, and
+        quietly "correcting" it would send a figure the candidate never wrote.
+        """
+        if self.expected_ctc_min_lpa is None and self.expected_ctc_max_lpa is None:
+            # WHY both ends and not just the min: a single stated figure is the
+            # whole expectation, so it is simultaneously the bottom and the top.
+            self.expected_ctc_min_lpa = self.expected_ctc_lpa
+            self.expected_ctc_max_lpa = self.expected_ctc_lpa
+        elif self.expected_ctc_lpa is not None:
+            # WHY warn rather than raise: the band is unambiguous on its own and
+            # the stale key changes nothing. Failing here would turn a harmless
+            # leftover line into a refusal to start.
+            log.warning(
+                "candidate.toml sets both expected_ctc_lpa (%s) and the "
+                "expected_ctc_min/max_lpa band. The band wins; delete the "
+                "single figure to silence this.",
+                self.expected_ctc_lpa,
+            )
+
+        lo, hi = self.expected_ctc_min_lpa, self.expected_ctc_max_lpa
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(
+                f"expected_ctc_min_lpa ({lo}) is above "
+                f"expected_ctc_max_lpa ({hi})"
+            )
+        return self
+
     def missing_fields(self) -> list[str]:
         """Names of profile fields still unset, in declaration order.
 
@@ -138,7 +234,7 @@ class _Candidate(BaseModel):
         return [
             field
             for field in self.__class__.model_fields
-            if field != "name" and getattr(self, field) is None
+            if field not in _NOT_REPORTED_MISSING and getattr(self, field) is None
         ]
 
 

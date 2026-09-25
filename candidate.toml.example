@@ -40,8 +40,19 @@ name = "FILL-ME: Your Full Name"
 # relevant_years = 12                   # years in your primary stack
 # stack = ".NET / Python"               # primary tech stack
 # current_ctc_lpa = 42.0                # current CTC, in LPA
-# expected_ctc_lpa = 55.0               # expected CTC, in LPA
-# notice_period = "60 days"             # e.g. "60 days", "immediate"
+# Expected CTC is a BAND, not a single figure. Both ends render into one
+# line — "45 LPA to 55 LPA (negotiable)". Set only one end and it renders as
+# that single number; set neither and the line is dropped.
+# GOTCHA: min > max raises at startup rather than silently swapping the two.
+# A reversed band is a typo in a number that goes out to a recruiter.
+# expected_ctc_min_lpa = 45.0           # bottom of the band — see rules.ctc_floor_lpa
+# expected_ctc_max_lpa = 55.0           # top of the band, what you open with
+#
+# expected_ctc_lpa = 55.0               # DEPRECATED (D83): the pre-band single
+#   figure. Still accepted so older profiles boot — it fills both ends of the
+#   band — but prefer the two lines above. Setting both forms warns at startup
+#   and the band wins.
+# notice_period = "60 days"             # e.g. "60 days", "Immediate Joiner"
 # current_location = "Delhi NCR"        # where you are now
 # preferred_location = "Delhi NCR or remote"
 # employment_status = "Currently employed"
