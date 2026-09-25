@@ -281,3 +281,93 @@ def test_dotted_and_hyphenated_names_split_correctly():
 def test_no_name_anywhere_falls_back():
     assert _sal(None, None) == "there"
     assert _sal("", "") == "there"
+
+
+# --- D83: expected CTC is a band, not a point --------------------------------
+
+
+def _profile_with(**candidate_overrides) -> CandidateProfile:
+    """A minimal valid profile with the candidate block patched.
+
+    WHY a builder rather than more fixtures: every case below differs by one
+    or two CTC keys, and a fixture per shape would bury that difference.
+    """
+    candidate = {"name": "Hemant Kumar Tyagi", "stack": "AI/ML"}
+    candidate.update(candidate_overrides)
+    return CandidateProfile.model_validate(
+        {
+            "candidate": candidate,
+            "rules": {"ctc_floor_lpa": 38.0},
+            "scoring": {"fit_threshold": 65},
+            "drafts": {"max_length_chars": 3000},
+        }
+    )
+
+
+def test_expected_ctc_band_renders_both_ends():
+    from app.drafts.generator import _answer_table
+
+    p = _profile_with(expected_ctc_min_lpa=32, expected_ctc_max_lpa=42)
+    assert _answer_table(p)["Expected CTC"] == "32 LPA to 42 LPA (negotiable)"
+
+
+def test_legacy_single_expected_ctc_still_renders_as_one_figure():
+    """A pre-D83 profile must produce byte-identical outbound text.
+
+    This is the whole justification for keeping `expected_ctc_lpa` alive: the
+    profile on the deployment host is gitignored, so no deploy rewrites it. If
+    the old key stopped working, the next deploy would take the agent down on
+    a config nobody edited.
+    """
+    from app.drafts.generator import _answer_table
+
+    p = _profile_with(expected_ctc_lpa=55)
+    assert _answer_table(p)["Expected CTC"] == "55 LPA (negotiable)"
+    # Folded into the band rather than left dangling, so every consumer reads
+    # the pair and nothing has to special-case the legacy key.
+    assert p.candidate.expected_ctc_min_lpa == 55
+    assert p.candidate.expected_ctc_max_lpa == 55
+
+
+def test_a_band_whose_ends_are_equal_collapses_to_one_figure():
+    from app.drafts.generator import _answer_table
+
+    p = _profile_with(expected_ctc_min_lpa=40, expected_ctc_max_lpa=40)
+    assert _answer_table(p)["Expected CTC"] == "40 LPA (negotiable)"
+
+
+def test_inverted_band_is_rejected_at_load():
+    """min > max must raise, not silently swap.
+
+    A reversed band is a typo in a figure that goes out to a recruiter, and
+    quietly correcting it would send a number the candidate never wrote.
+    """
+    with pytest.raises(ValueError, match="expected_ctc_min_lpa"):
+        _profile_with(expected_ctc_min_lpa=50, expected_ctc_max_lpa=40)
+
+
+def test_unset_expectation_is_dropped_not_rendered_as_na():
+    from app.drafts.generator import DEFAULT_FACT_LABELS, render_answer_lines
+
+    p = _profile_with()
+    assert not any("Expected CTC" in line for line in render_answer_lines(p, DEFAULT_FACT_LABELS))
+
+
+def test_legacy_key_is_not_reported_as_an_unfilled_field():
+    """Startup must not nag about a field the band correctly replaced."""
+    p = _profile_with(expected_ctc_min_lpa=32, expected_ctc_max_lpa=42)
+    assert "expected_ctc_lpa" not in p.candidate.missing_fields()
+
+
+def test_interested_draft_puts_one_field_per_line(profile, parsed_factory):
+    """D83: this path no longer packs two fields onto a line.
+
+    D68 established one-field-per-line for ATS paste and fixed only the LLM
+    and questionnaire paths. The regression this pins is the interested draft
+    drifting back to its own bullet list.
+    """
+    body = build_interested(parsed_factory(), Opportunity(role_title="X", company="Y"), profile)
+    assert "Current CTC: 42 LPA" in body
+    assert "·" not in body
+    for label in ("Total Experience", "Relevant Experience", "Current CTC", "Notice Period"):
+        assert f"{label}: " in body

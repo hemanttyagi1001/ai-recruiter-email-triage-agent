@@ -56,7 +56,7 @@ route to review.
 
 from __future__ import annotations
 
-from app.candidate import CandidateProfile, render
+from app.candidate import CandidateProfile, render, render_ctc_band
 from app.llm.client import LLMClient, Usage
 from app.llm.schemas import FitScore, Opportunity
 
@@ -73,7 +73,7 @@ def _build_system_prompt(profile: CandidateProfile) -> str:
 
 Candidate:
 - {render(c.total_years)} years total, {render(c.relevant_years)} years in {render(c.stack)}
-- Current CTC: {render(c.current_ctc_lpa)} LPA, Expected: {render(c.expected_ctc_lpa)} LPA
+- Current CTC: {render(c.current_ctc_lpa)} LPA, Expected: {render_ctc_band(c.expected_ctc_min_lpa, c.expected_ctc_max_lpa)}
 - Notice period: {render(c.notice_period)}
 - Location: {render(c.current_location)}, preferred: {render(c.preferred_location)}
 - Status: {render(c.employment_status)}

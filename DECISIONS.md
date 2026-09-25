@@ -1935,3 +1935,32 @@ compose service, nginx, certbot and authentication in front of it — a
 human-approval endpoint on the open internet is not acceptable unauthenticated),
 or if a second environment appears and one clone on one box stops being the
 whole topology.
+
+## D83 — Expected CTC is a band, and one renderer owns it (2026-09-25)
+
+**Decision:** `expected_ctc_lpa` (a single float) is replaced by
+`expected_ctc_min_lpa` / `expected_ctc_max_lpa`, mirroring how `Opportunity`
+already models a recruiter's budget. `render_ctc_band()` in `app/candidate.py`
+is the only place the pair becomes text; the draft generator wraps it to add
+"(negotiable)", which the fit scorer deliberately does not get. Setting both
+ends to the same number collapses the output back to one figure, so a single
+stated expectation is still expressible.
+
+**Alternatives considered:** a free-text `expected_ctc` string, rejected because
+the LLM drafter's compensation rule needs a number to compare against; and
+deleting the old key outright, rejected because `_Candidate` forbids extra keys
+and the profile on the VPS is gitignored — no deploy rewrites it, so the next
+deploy would have killed the agent on a config nobody touched. The old key is
+therefore still accepted and folds into both ends of the band, with a startup
+warning if both forms are set.
+
+**Also:** `interested.txt` now renders the shared facts block instead of its own
+bullet list. D68 established one-field-per-line for ATS paste but only fixed the
+LLM and questionnaire paths, so the reply format depended on which drafter fired.
+Side effect: that draft no longer volunteers `employment_status`, which is not in
+`DEFAULT_FACT_LABELS`. `pivot.txt` is still on the old packed shape.
+
+**Revisit if:** a recruiter form needs the two ends in separate fields (the
+renderer returns one string and would need splitting), or if the compensation
+floor moves from the LLM's prompt into the outbound validator, where the
+standing rule says hard limits belong — rule 3 is currently advisory only.
